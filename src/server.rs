@@ -1,12 +1,13 @@
-//! yedit's loopback server: the viewport page + its same-origin API, and the
-//! libyggterm sidebar control endpoint (`GET /pane/notes`, `POST /action`).
+//! yedit's control endpoint: `GET /pane/doc` (the document schema) and
+//! `POST /action` (everything the user does in it). Hand-rolled HTTP over
+//! `TcpListener` (the ychrome pattern): one tiny request shape, no framework.
 //!
-//! Hand-rolled HTTP over `TcpListener` (the ychrome pattern): one tiny request
-//! shape, no framework. The GUI reaches `/pane/*` and `/action` over a plain
-//! socket; the page reaches `/api/*` same-origin from the surface webview.
+//! yedit renders NOTHING itself — the schema declares widgets and yggterm
+//! paints them as shell DOM. The editor draft rides `values.editor` on every
+//! action POST (the GUI sends the pane's declared values back), so any action
+//! — save, mode toggle, tab switch — flushes the user's edits up first.
 
-use crate::docs::{SaveOutcome, Store};
-use crate::render;
+use crate::docs::{note_id, SaveOutcome, Store};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -14,15 +15,26 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// The store plus pane-local UI state (the pending save conflict).
+pub struct PaneState {
+    pub store: Store,
+    /// Set when a save hit the revision guard; the schema then shows the
+    /// Overwrite / Reload choice until the user picks one.
+    pub conflict: Option<String>,
+}
+
 pub struct Server {
     pub url: String,
-    pub state: Arc<Mutex<Store>>,
+    pub state: Arc<Mutex<PaneState>>,
 }
 
 pub fn spawn(store: Store) -> Result<Server> {
-    let listener = TcpListener::bind("127.0.0.1:0").context("binding yedit server")?;
+    let listener = TcpListener::bind("127.0.0.1:0").context("binding yedit control server")?;
     let port = listener.local_addr()?.port();
-    let state = Arc::new(Mutex::new(store));
+    let state = Arc::new(Mutex::new(PaneState {
+        store,
+        conflict: None,
+    }));
     {
         let state = Arc::clone(&state);
         std::thread::spawn(move || {
@@ -39,7 +51,7 @@ pub fn spawn(store: Store) -> Result<Server> {
     })
 }
 
-fn handle_conn(stream: TcpStream, state: &Mutex<Store>) {
+fn handle_conn(stream: TcpStream, state: &Mutex<PaneState>) {
     let Ok(peek) = stream.try_clone() else { return };
     let mut reader = BufReader::new(peek);
     let mut line = String::new();
@@ -49,7 +61,7 @@ fn handle_conn(stream: TcpStream, state: &Mutex<Store>) {
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("/");
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let (path, _query) = target.split_once('?').unwrap_or((target, ""));
 
     let mut content_length = 0usize;
     loop {
@@ -74,238 +86,235 @@ fn handle_conn(stream: TcpStream, state: &Mutex<Store>) {
     };
 
     match (method, path) {
-        ("GET", "/") => respond_html(stream, render::page_html()),
-        ("GET", "/api/state") => {
-            let store = state.lock().unwrap();
-            respond_json(stream, 200, &state_json(&store));
-        }
-        ("GET", "/api/doc") => {
-            let id = query_value(query, "id").unwrap_or_default();
-            let mut store = state.lock().unwrap();
-            if query_value(query, "reload").is_some() {
-                let _ = store.reload(&id);
-            }
-            match store.get(&id) {
-                Some(note) => {
-                    let payload = json!({
-                        "id": note.id,
-                        "name": note.name(),
-                        "path": note.path.to_string_lossy(),
-                        "content": note.content,
-                        "html": render::markdown_to_html(&note.content),
-                        "dirty": note.dirty,
-                    });
-                    respond_json(stream, 200, &payload);
-                }
-                None => respond_json(stream, 404, &json!({ "error": "unknown note" })),
-            }
-        }
-        ("POST", "/api/edit") => {
-            let id = body["id"].as_str().unwrap_or_default().to_string();
-            let content = body["content"].as_str().unwrap_or_default().to_string();
-            let mut store = state.lock().unwrap();
-            store.edit(&id, content);
-            respond_json(stream, 200, &json!({ "ok": true }));
-        }
-        ("POST", "/api/save") => {
-            let id = body["id"].as_str().unwrap_or_default().to_string();
-            let content = body["content"].as_str().unwrap_or_default().to_string();
-            let force = body["force"].as_bool().unwrap_or(false);
-            let mut store = state.lock().unwrap();
-            match store.save(&id, content, force) {
-                Ok(SaveOutcome::Saved { revision }) => {
-                    respond_json(stream, 200, &json!({ "ok": true, "revision": revision }));
-                }
-                Ok(SaveOutcome::Conflict { disk, loaded }) => {
-                    respond_json(
-                        stream,
-                        409,
-                        &json!({ "conflict": true, "disk": disk, "loaded": loaded }),
-                    );
-                }
-                Err(error) => {
-                    respond_json(stream, 500, &json!({ "error": error.to_string() }));
-                }
-            }
-        }
-        ("POST", "/api/reload") => {
-            let id = body["id"].as_str().unwrap_or_default().to_string();
-            let mut store = state.lock().unwrap();
-            match store.reload(&id) {
-                Ok(()) => respond_json(stream, 200, &json!({ "ok": true })),
-                Err(error) => respond_json(stream, 500, &json!({ "error": error.to_string() })),
-            }
-        }
-        ("POST", "/api/open") => {
-            let path = body["path"].as_str().unwrap_or_default().to_string();
-            let mut store = state.lock().unwrap();
-            match store.open(Path::new(&path)) {
-                Ok(id) => respond_json(stream, 200, &json!({ "ok": true, "id": id })),
-                Err(error) => respond_json(stream, 500, &json!({ "error": error.to_string() })),
-            }
-        }
-        ("POST", "/api/mode") => {
-            let markdown = body["markdown"].as_bool().unwrap_or(true);
-            let mut store = state.lock().unwrap();
-            store.markdown_mode = markdown;
-            store.touch();
-            respond_json(stream, 200, &json!({ "markdown_mode": store.markdown_mode }));
-        }
-        ("GET", "/pane/notes") => {
-            let store = state.lock().unwrap();
-            respond_json(stream, 200, &pane_schema(&store, None));
+        ("GET", "/pane/doc") => {
+            let pane = state.lock().unwrap();
+            respond_json(stream, 200, &document_schema(&pane));
         }
         ("POST", "/action") => {
-            let reply = handle_pane_action(state, &body);
+            let reply = handle_action(state, &body);
             respond_json(stream, 200, &reply);
         }
         _ => respond_json(stream, 404, &json!({})),
     }
 }
 
-fn state_json(store: &Store) -> Value {
-    json!({
-        "active_id": store.active_id,
-        "markdown_mode": store.markdown_mode,
-        "epoch": store.epoch,
-        "notes": store.notes.iter().map(|n| json!({
-            "id": n.id, "name": n.name(), "dirty": n.dirty,
-        })).collect::<Vec<_>>(),
-        "recent": store.recent.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
-    })
-}
-
-/// The contributed Notes pane: vertical note tabs (open = switch, ✕ = close),
-/// an open-or-create path box, and recent files. This IS yedit's v1 file
-/// picker; the module boundary is the extraction seam for the shared
-/// libyggterm picker component once a second app needs one
-/// (extraction-not-construction).
-fn pane_schema(store: &Store, draft_path: Option<&str>) -> Value {
-    let mut widgets = vec![json!({ "kind": "section", "text": "Open notes" })];
-    if store.notes.is_empty() {
+/// The whole document surface, as widgets. Bar (in declaration order): note
+/// tabs, markdown toggle, save, close, dirty marker + path label, and the
+/// open-or-create input. Body: the rendered markdown OR the plain editor —
+/// or, with nothing open, the recent files as rows.
+fn document_schema(pane: &PaneState) -> Value {
+    let store = &pane.store;
+    let mut widgets: Vec<Value> = Vec::new();
+    if !store.notes.is_empty() {
+        let tabs: Vec<Value> = store
+            .notes
+            .iter()
+            .map(|note| {
+                let label = if note.dirty {
+                    format!("● {}", note.name())
+                } else {
+                    note.name()
+                };
+                json!({ "id": note.id, "label": label })
+            })
+            .collect();
         widgets.push(json!({
-            "kind": "label", "muted": true,
-            "text": "No notes open. Open one below.",
+            "kind": "tabs", "id": "tabs", "action": "switch",
+            "tabs": tabs,
+            "active": store.active_id.clone().unwrap_or_default(),
         }));
-    }
-    for note in &store.notes {
-        let active = store.active_id.as_deref() == Some(note.id.as_str());
-        let mut title = note.name();
-        if note.dirty {
-            title = format!("● {title}");
-        }
-        if active {
-            title = format!("▸ {title}");
-        }
         widgets.push(json!({
-            "kind": "list-row",
-            "id": note.id,
-            "title": title,
-            "subtitle": note.path.to_string_lossy(),
-            "actions": [
-                { "action": "open_note", "label": "⤢", "title": "Show this note in the viewport" },
-                { "action": "close_note", "label": "✕", "title": "Close this note (unsaved edits are kept until yedit exits)" },
-            ],
+            "kind": "toggle", "id": "markdown_mode", "label": "Markdown",
+            "action": "toggle_markdown", "value": store.markdown_mode,
         }));
-    }
-    widgets.push(json!({ "kind": "section", "text": "Open or create" }));
-    widgets.push(json!({
-        "kind": "text-input", "id": "open_path",
-        "label": "Path", "placeholder": "~/notes/todo.md",
-        "value": draft_path.unwrap_or(""),
-        "action": "open_path",
-    }));
-    widgets.push(json!({
-        "kind": "button", "id": "open_btn", "label": "Open",
-        "action": "open_path", "primary": true,
-    }));
-    if !store.recent.is_empty() {
-        widgets.push(json!({ "kind": "section", "text": "Recent" }));
-        for path in store.recent.iter().take(8) {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        if let Some(conflict) = &pane.conflict {
             widgets.push(json!({
-                "kind": "list-row",
-                "id": format!("recent-{}", crate::docs::note_id(path)),
-                "title": name,
-                "subtitle": path.to_string_lossy(),
-                "actions": [
-                    { "action": "open_recent", "label": "⤢", "title": "Open this file" },
-                ],
+                "kind": "label", "muted": true,
+                "text": format!("⚠ {conflict} changed on disk"),
+            }));
+            widgets.push(json!({
+                "kind": "button", "id": "overwrite", "label": "Overwrite",
+                "action": "overwrite", "primary": true,
+            }));
+            widgets.push(json!({
+                "kind": "button", "id": "reload", "label": "Reload from disk",
+                "action": "reload",
+            }));
+        } else {
+            widgets.push(json!({
+                "kind": "button", "id": "save", "label": "💾\u{fe0e} Save",
+                "action": "save",
+                "primary": store.active().is_some_and(|note| note.dirty),
             }));
         }
+        widgets.push(json!({
+            "kind": "button", "id": "close", "label": "✕",
+            "action": "close_active",
+        }));
+        if let Some(note) = store.active() {
+            widgets.push(json!({
+                "kind": "label", "muted": true,
+                "text": note.path.to_string_lossy(),
+            }));
+        }
+    } else {
+        widgets.push(json!({ "kind": "section", "text": "yedit" }));
     }
-    json!({ "title": "Yedit notes", "widgets": widgets })
-}
+    widgets.push(json!({
+        "kind": "text-input", "id": "open_path",
+        "placeholder": "open or create: ~/notes/todo.md",
+        "value": "", "action": "open",
+    }));
+    widgets.push(json!({
+        "kind": "button", "id": "open_btn", "label": "Open", "action": "open",
+    }));
 
-fn handle_pane_action(state: &Mutex<Store>, body: &Value) -> Value {
-    let action = body["action"].as_str().unwrap_or_default();
-    let values = &body["values"];
-    // A list-row's item id rides `values.value` (yggterm's app-pane action
-    // POST shape); `body.row` kept as a fallback for direct API callers.
-    let row = values["value"]
-        .as_str()
-        .or_else(|| body["row"].as_str())
-        .unwrap_or_default();
-    let mut store = state.lock().unwrap();
-    let mut toast: Option<String> = None;
-    let mut draft: Option<String> = None;
-    match action {
-        "open_note" => {
-            if store.notes.iter().any(|n| n.id == row) {
-                store.active_id = Some(row.to_string());
-                store.touch();
+    match store.active() {
+        Some(note) if store.markdown_mode => {
+            widgets.push(json!({
+                "kind": "markdown", "id": "body", "source": note.content,
+            }));
+        }
+        Some(note) => {
+            widgets.push(json!({
+                "kind": "text-input", "id": "editor", "multiline": true,
+                "value": note.content, "rows": 40,
+            }));
+        }
+        None => {
+            for path in store.recent.iter().take(10) {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                widgets.push(json!({
+                    "kind": "list-row",
+                    "id": format!("recent-{}", note_id(path)),
+                    "title": name,
+                    "subtitle": path.to_string_lossy(),
+                    "actions": [
+                        { "action": "open_recent", "label": "⤢", "title": "Open this file" },
+                    ],
+                }));
             }
         }
-        "close_note" => {
-            store.close(row);
+    }
+    json!({ "title": "Yedit", "widgets": widgets })
+}
+
+/// Flush the editor draft up into the active note. Runs FIRST on every
+/// action, so a mode toggle or tab switch never loses typed content. The
+/// draft only exists while the plain editor is on screen.
+fn absorb_editor_draft(pane: &mut PaneState, values: &Value) {
+    let Some(draft) = values["editor"].as_str() else {
+        return;
+    };
+    let Some(active_id) = pane.store.active_id.clone() else {
+        return;
+    };
+    if !pane.store.markdown_mode {
+        pane.store.edit(&active_id, draft.to_string());
+    }
+}
+
+fn handle_action(state: &Mutex<PaneState>, body: &Value) -> Value {
+    let action = body["action"].as_str().unwrap_or_default();
+    let values = &body["values"];
+    // A widget's own value (a tab id, a row id, a toggle's next state) rides
+    // `values.value` — yggterm's action POST shape (trap recorded 2026-07-17).
+    let value = values["value"].as_str().unwrap_or_default().to_string();
+    let mut pane = state.lock().unwrap();
+    absorb_editor_draft(&mut pane, values);
+    let mut toast: Option<String> = None;
+    match action {
+        "switch" => {
+            if pane.store.notes.iter().any(|n| n.id == value) {
+                pane.store.active_id = Some(value);
+                pane.conflict = None;
+                pane.store.touch();
+            }
         }
-        "open_path" => {
-            let raw = values["open_path"].as_str().unwrap_or_default().trim().to_string();
-            if raw.is_empty() {
-                toast = Some("Enter a path to open".to_string());
-            } else {
-                match store.open(Path::new(&raw)) {
-                    Ok(_) => toast = Some(format!("Opened {raw}")),
-                    Err(error) => {
-                        toast = Some(format!("Open failed: {error}"));
-                        draft = Some(raw);
+        "toggle_markdown" => {
+            let next = value.parse::<bool>().unwrap_or(!pane.store.markdown_mode);
+            pane.store.markdown_mode = next;
+            pane.store.touch();
+        }
+        "save" | "overwrite" => {
+            let force = action == "overwrite";
+            if let Some(id) = pane.store.active_id.clone() {
+                let content = pane
+                    .store
+                    .get(&id)
+                    .map(|note| note.content.clone())
+                    .unwrap_or_default();
+                match pane.store.save(&id, content, force) {
+                    Ok(SaveOutcome::Saved { .. }) => {
+                        pane.conflict = None;
+                        toast = Some("Saved".to_string());
                     }
+                    Ok(SaveOutcome::Conflict { .. }) => {
+                        let name = pane
+                            .store
+                            .get(&id)
+                            .map(|note| note.name())
+                            .unwrap_or_default();
+                        pane.conflict = Some(name);
+                    }
+                    Err(error) => toast = Some(format!("Save failed: {error}")),
                 }
             }
         }
+        "reload" => {
+            if let Some(id) = pane.store.active_id.clone() {
+                match pane.store.reload(&id) {
+                    Ok(()) => {
+                        pane.conflict = None;
+                        toast = Some("Reloaded from disk".to_string());
+                    }
+                    Err(error) => toast = Some(format!("Reload failed: {error}")),
+                }
+            }
+        }
+        "close_active" => {
+            if let Some(id) = pane.store.active_id.clone() {
+                pane.store.close(&id);
+                pane.conflict = None;
+            }
+        }
+        "open" => {
+            let raw = values["open_path"].as_str().unwrap_or_default().trim().to_string();
+            if raw.is_empty() {
+                toast = Some("Enter a path to open".to_string());
+            } else if let Err(error) = pane.store.open(Path::new(&raw)) {
+                toast = Some(format!("Open failed: {error}"));
+            }
+        }
         "open_recent" => {
-            let recent: Option<PathBuf> = store
+            let recent: Option<PathBuf> = pane
+                .store
                 .recent
                 .iter()
-                .find(|p| format!("recent-{}", crate::docs::note_id(p)) == row)
+                .find(|p| format!("recent-{}", note_id(p)) == value)
                 .cloned();
             if let Some(path) = recent {
-                if let Err(error) = store.open(&path) {
+                if let Err(error) = pane.store.open(&path) {
                     toast = Some(format!("Open failed: {error}"));
                 }
             }
         }
         _ => toast = Some(format!("Unknown action {action}")),
     }
-    let mut reply = json!({
-        "schema": pane_schema(&store, draft.as_deref()),
-        // Nudge the page off its poll interval so a pane click lands at once.
-        "eval": "window.yeditPoll && window.yeditPoll()",
-    });
+    let mut reply = json!({ "schema": document_schema(&pane) });
     if let Some(toast) = toast {
         reply["toast"] = Value::String(toast);
     }
     reply
 }
 
-fn query_value(query: &str, key: &str) -> Option<String> {
-    query.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=')?;
-        (k == key).then(|| v.to_string())
-    })
+/// The declare stamp: schema content changes exactly when the store mutates.
+pub fn document_version(state: &Mutex<PaneState>) -> String {
+    let pane = state.lock().unwrap();
+    format!("{}:{}", pane.store.epoch, pane.conflict.is_some())
 }
 
 fn respond_json(mut stream: TcpStream, status: u16, value: &Value) {
@@ -313,21 +322,11 @@ fn respond_json(mut stream: TcpStream, status: u16, value: &Value) {
     let reason = match status {
         200 => "OK",
         404 => "Not Found",
-        409 => "Conflict",
         _ => "Error",
     };
     let _ = write!(
         stream,
         "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-        body.len(),
-    );
-    let _ = stream.flush();
-}
-
-fn respond_html(mut stream: TcpStream, body: &str) {
-    let _ = write!(
-        stream,
-        "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len(),
     );
     let _ = stream.flush();
