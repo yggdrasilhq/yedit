@@ -36,6 +36,33 @@ pub fn disk_revision(path: &Path) -> String {
     format!("{mtime_ms}:{}", metadata.len())
 }
 
+/// The document view's tri-state (the sidebar tri-slider, libyggterm
+/// Phase 4): pure rendered markdown, editor + live preview, or plain text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ViewMode {
+    Markdown,
+    Split,
+    Text,
+}
+
+impl ViewMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ViewMode::Markdown => "markdown",
+            ViewMode::Split => "split",
+            ViewMode::Text => "text",
+        }
+    }
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "markdown" => Some(ViewMode::Markdown),
+            "split" => Some(ViewMode::Split),
+            "text" => Some(ViewMode::Text),
+            _ => None,
+        }
+    }
+}
+
 pub struct Note {
     pub id: String,
     pub path: PathBuf,
@@ -58,7 +85,7 @@ impl Note {
 pub struct Store {
     pub notes: Vec<Note>,
     pub active_id: Option<String>,
-    pub markdown_mode: bool,
+    pub view_mode: ViewMode,
     /// Bumped on every mutation; the page polls it to know when to refetch.
     pub epoch: u64,
     pub recent: Vec<PathBuf>,
@@ -91,7 +118,7 @@ impl Store {
         let mut store = Self {
             notes: Vec::new(),
             active_id: None,
-            markdown_mode: true,
+            view_mode: ViewMode::Split,
             epoch: 1,
             recent: Vec::new(),
             home,
@@ -148,7 +175,16 @@ impl Store {
         let Some(value) = self.session_value() else {
             return;
         };
-        self.markdown_mode = value["markdown_mode"].as_bool().unwrap_or(true);
+        // `view_mode` is the tri-state; the pre-tri-slider `markdown_mode`
+        // bool migrates true→Split (that WAS the editing-with-preview mode)
+        // and false→Text.
+        self.view_mode = value["view_mode"]
+            .as_str()
+            .and_then(ViewMode::parse)
+            .unwrap_or_else(|| match value["markdown_mode"].as_bool() {
+                Some(false) => ViewMode::Text,
+                _ => ViewMode::Split,
+            });
         if let Some(recent) = value["recent"].as_array() {
             self.recent = recent
                 .iter()
@@ -247,7 +283,7 @@ impl Store {
             .active()
             .map(|n| n.path.to_string_lossy().into_owned());
         let value = json!({
-            "markdown_mode": self.markdown_mode,
+            "view_mode": self.view_mode.as_str(),
             "open": self.notes.iter().map(|n| n.path.to_string_lossy()).collect::<Vec<_>>(),
             "active": active_path,
             "recent": self.recent.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
@@ -483,7 +519,7 @@ mod tests {
             store.open(&a).unwrap();
             let id_b = store.open(&b).unwrap();
             store.active_id = Some(id_b);
-            store.markdown_mode = false;
+            store.view_mode = ViewMode::Text;
             store.touch();
         }
         let restored = Store::new(home.clone());
@@ -493,7 +529,7 @@ mod tests {
             Some("b.md".to_string()),
             "the active tab restores"
         );
-        assert!(!restored.markdown_mode, "markdown mode restores");
+        assert_eq!(restored.view_mode, ViewMode::Text, "the view mode restores");
         let _ = std::fs::remove_dir_all(&home);
     }
 

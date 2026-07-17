@@ -161,13 +161,19 @@ fn handle_conn(stream: TcpStream, state: &Mutex<PaneState>) {
 /// markdown mode, the line-numbered plain editor otherwise; the recent files
 /// when nothing is open. Every control lives in the sidebar pane.
 fn document_schema(pane: &PaneState) -> Value {
+    use crate::docs::ViewMode;
     let store = &pane.store;
     let mut widgets: Vec<Value> = Vec::new();
     match store.active() {
-        Some(note) if store.markdown_mode => {
-            // Markdown mode EDITS too (user 2026-07-17): editor left,
-            // live preview right — the preview renders the editor's draft
-            // per keystroke GUI-side (live_from), no round trip.
+        // The tri-slider's three states (libyggterm Phase 4):
+        // Markdown = pure rendered reader; Split = editor + per-keystroke
+        // live preview (live_from, no round trip); Text = plain editor.
+        Some(note) if store.view_mode == ViewMode::Markdown => {
+            widgets.push(json!({
+                "kind": "markdown", "id": "body", "source": note.content,
+            }));
+        }
+        Some(note) if store.view_mode == ViewMode::Split => {
             widgets.push(json!({
                 "kind": "text-input", "id": "editor", "multiline": true,
                 "line_numbers": true, "value": note.content,
@@ -260,9 +266,17 @@ fn notes_schema(pane: &PaneState) -> Value {
         "placeholder": "Search notes (regex)…",
         "value": pane.search, "action": "search",
     }));
+    // The tri-slider (Phase 4): yggterm renders `tabs` as its standard
+    // segmented control, so the mode switch looks like every other yggui
+    // mode switch.
     widgets.push(json!({
-        "kind": "toggle", "id": "markdown_mode", "label": "Markdown",
-        "action": "toggle_markdown", "value": store.markdown_mode,
+        "kind": "tabs", "id": "mode", "action": "set_mode",
+        "active": store.view_mode.as_str(),
+        "tabs": [
+            { "id": "markdown", "label": "Markdown" },
+            { "id": "split", "label": "Split" },
+            { "id": "text", "label": "Text" },
+        ],
     }));
     widgets.push(json!({
         "kind": "section", "text": "Files",
@@ -367,10 +381,11 @@ fn handle_action(state: &Mutex<PaneState>, body: &Value) -> Value {
                 pane.store.touch();
             }
         }
-        "toggle_markdown" => {
-            let next = value.parse::<bool>().unwrap_or(!pane.store.markdown_mode);
-            pane.store.markdown_mode = next;
-            pane.store.touch();
+        "set_mode" => {
+            if let Some(mode) = crate::docs::ViewMode::parse(&value) {
+                pane.store.view_mode = mode;
+                pane.store.touch();
+            }
         }
         "save" | "overwrite" => {
             let force = action == "overwrite";
