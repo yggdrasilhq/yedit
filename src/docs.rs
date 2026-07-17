@@ -63,6 +63,13 @@ pub struct Store {
     pub epoch: u64,
     pub recent: Vec<PathBuf>,
     home: PathBuf,
+    /// `~/.yggterm/yedit/state.sqlite3` (WAL) — the ONE durable store:
+    /// session state (open tabs, active, mode, recents) and DRAFTS. A draft
+    /// is a FULL-CONTENT row per dirty note (diffs rejected: notepad scale,
+    /// atomicity beats cleverness); saved ⇒ row deleted; a crash ⇒ the next
+    /// start reopens with the dirty buffers intact. `None` only when the db
+    /// cannot open — yedit still works, just without crash safety.
+    db: Option<rusqlite::Connection>,
 }
 
 /// What a save attempt came to.
@@ -80,6 +87,7 @@ impl Store {
     }
 
     pub fn new(home: PathBuf) -> Self {
+        let db = Self::open_db(&home);
         let mut store = Self {
             notes: Vec::new(),
             active_id: None,
@@ -87,23 +95,57 @@ impl Store {
             epoch: 1,
             recent: Vec::new(),
             home,
+            db,
         };
         store.load_session();
+        store.restore_drafts();
         store
     }
 
-    fn session_path(&self) -> PathBuf {
+    fn open_db(home: &Path) -> Option<rusqlite::Connection> {
+        let dir = Self::state_dir(home);
+        std::fs::create_dir_all(&dir).ok()?;
+        let db = rusqlite::Connection::open(dir.join("state.sqlite3")).ok()?;
+        let _ = db.pragma_update(None, "journal_mode", "WAL");
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS drafts (
+                 path TEXT PRIMARY KEY,
+                 base_revision TEXT NOT NULL,
+                 content TEXT NOT NULL,
+                 updated_ms INTEGER NOT NULL
+             );",
+        )
+        .ok()?;
+        Some(db)
+    }
+
+    fn session_json_path(&self) -> PathBuf {
         Self::state_dir(&self.home).join("session.json")
+    }
+
+    fn session_value(&self) -> Option<Value> {
+        // The db owns the session; `session.json` remains readable ONCE as
+        // the pre-sqlite migration source, and is deleted after the first
+        // db persist so there is never a second store to diverge.
+        if let Some(db) = &self.db
+            && let Ok(text) = db.query_row(
+                "SELECT value FROM session WHERE key = 'state'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+        {
+            return serde_json::from_str(&text).ok();
+        }
+        let bytes = std::fs::read(self.session_json_path()).ok()?;
+        serde_json::from_slice(&bytes).ok()
     }
 
     /// Restore markdown-mode, recents, and the previously open tabs — the
     /// "yedit reopens its tabs" half of the acceptance test. Files that no
     /// longer exist are dropped silently.
     fn load_session(&mut self) {
-        let Ok(bytes) = std::fs::read(self.session_path()) else {
-            return;
-        };
-        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        let Some(value) = self.session_value() else {
             return;
         };
         self.markdown_mode = value["markdown_mode"].as_bool().unwrap_or(true);
@@ -135,9 +177,72 @@ impl Store {
         }
     }
 
+    /// Crash safety: any draft row whose note is open replaces the disk
+    /// content in the buffer (dirty), exactly as if the process had never
+    /// died. A draft for a file that is NOT in the restored session opens as
+    /// a tab too — an unsaved buffer must never be silently invisible.
+    fn restore_drafts(&mut self) {
+        let rows: Vec<(String, String, String)> = match &self.db {
+            Some(db) => {
+                let Ok(mut stmt) =
+                    db.prepare("SELECT path, base_revision, content FROM drafts")
+                else {
+                    return;
+                };
+                stmt.query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map(|rows| rows.flatten().collect())
+                .unwrap_or_default()
+            }
+            None => return,
+        };
+        for (path_text, base_revision, content) in rows {
+            let path = PathBuf::from(&path_text);
+            let id = note_id(&path);
+            if !self.notes.iter().any(|n| n.id == id) {
+                let _ = self.open(&path);
+            }
+            if let Some(note) = self.get_mut(&id) {
+                note.content = content;
+                note.loaded_revision = base_revision;
+                note.dirty = true;
+            }
+        }
+        self.epoch += 1;
+    }
+
+    fn upsert_draft(&self, note: &Note) {
+        let Some(db) = &self.db else { return };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or_default();
+        let _ = db.execute(
+            "INSERT INTO drafts (path, base_revision, content, updated_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(path) DO UPDATE SET
+                 base_revision = excluded.base_revision,
+                 content = excluded.content,
+                 updated_ms = excluded.updated_ms",
+            rusqlite::params![
+                note.path.to_string_lossy(),
+                note.loaded_revision,
+                note.content,
+                now_ms
+            ],
+        );
+    }
+
+    fn delete_draft(&self, path: &Path) {
+        let Some(db) = &self.db else { return };
+        let _ = db.execute(
+            "DELETE FROM drafts WHERE path = ?1",
+            rusqlite::params![path.to_string_lossy()],
+        );
+    }
+
     pub fn persist_session(&self) {
-        let dir = Self::state_dir(&self.home);
-        let _ = std::fs::create_dir_all(&dir);
         let active_path = self
             .active()
             .map(|n| n.path.to_string_lossy().into_owned());
@@ -147,10 +252,23 @@ impl Store {
             "active": active_path,
             "recent": self.recent.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
         });
-        let _ = std::fs::write(
-            self.session_path(),
-            serde_json::to_string_pretty(&value).unwrap_or_default(),
+        let Some(db) = &self.db else {
+            // No db (open failed): fall back to the legacy file rather than
+            // losing the session entirely.
+            let _ = std::fs::create_dir_all(Self::state_dir(&self.home));
+            let _ = std::fs::write(
+                self.session_json_path(),
+                serde_json::to_string_pretty(&value).unwrap_or_default(),
+            );
+            return;
+        };
+        let _ = db.execute(
+            "INSERT INTO session (key, value) VALUES ('state', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![value.to_string()],
         );
+        // The db persisted: retire the migration source so it cannot diverge.
+        let _ = std::fs::remove_file(self.session_json_path());
     }
 
     pub fn touch(&mut self) {
@@ -230,6 +348,11 @@ impl Store {
     }
 
     pub fn close(&mut self, id: &str) {
+        // Closing a tab is a DELIBERATE discard: the draft row goes with it
+        // (crash safety is for crashes, not for overriding the user).
+        if let Some(path) = self.get(id).map(|n| n.path.clone()) {
+            self.delete_draft(&path);
+        }
         self.notes.retain(|n| n.id != id);
         if self.active_id.as_deref() == Some(id) {
             self.active_id = self.notes.first().map(|n| n.id.clone());
@@ -239,12 +362,18 @@ impl Store {
 
     /// Update the editor buffer (the page mirrors edits up on a debounce so
     /// the dirty-dot and session persistence always see the latest draft).
+    /// Every edit writes the draft row through — the row IS the crash story.
     pub fn edit(&mut self, id: &str, content: String) {
+        let mut changed = false;
         if let Some(note) = self.get_mut(id) {
             if note.content != content {
                 note.content = content;
                 note.dirty = true;
+                changed = true;
             }
+        }
+        if changed && let Some(note) = self.get(id) {
+            self.upsert_draft(note);
         }
         self.epoch += 1;
     }
@@ -270,6 +399,9 @@ impl Store {
         note.loaded_revision = disk_revision(&note.path);
         note.dirty = false;
         let revision = note.loaded_revision.clone();
+        let saved_path = note.path.clone();
+        // Saved ⇒ the disk file is the truth again; the draft row retires.
+        self.delete_draft(&saved_path);
         self.touch();
         Ok(SaveOutcome::Saved { revision })
     }
@@ -284,6 +416,9 @@ impl Store {
             .with_context(|| format!("reading {}", note.path.display()))?;
         note.loaded_revision = disk_revision(&note.path);
         note.dirty = false;
+        let reloaded_path = note.path.clone();
+        // Reload-from-disk is the other deliberate discard.
+        self.delete_draft(&reloaded_path);
         self.touch();
         Ok(())
     }
@@ -359,6 +494,44 @@ mod tests {
             "the active tab restores"
         );
         assert!(!restored.markdown_mode, "markdown mode restores");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // The crash story (Phase 4): every edit writes a full-content draft row
+    // through to sqlite; a process death without save reopens the buffer
+    // dirty, exactly where it was. Save retires the row.
+    #[test]
+    fn a_crash_reopens_dirty_buffers_from_the_drafts_db() {
+        let home = temp_home("crash");
+        let file = home.join("note.md");
+        std::fs::write(&file, "on disk").unwrap();
+        let id = {
+            let mut store = Store::new(home.clone());
+            let id = store.open(&file).unwrap();
+            store.edit(&id, "typed but never saved".to_string());
+            id
+            // Dropped WITHOUT save/persist — the simulated crash.
+        };
+        let mut reborn = Store::new(home.clone());
+        let note = reborn.get(&id).expect("the draft's tab reopens");
+        assert!(note.dirty, "the buffer comes back dirty");
+        assert_eq!(note.content, "typed but never saved");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "on disk",
+            "the crash never touched the file"
+        );
+
+        // Save retires the row: the NEXT start is clean.
+        match reborn.save(&id, "typed but never saved".to_string(), false).unwrap() {
+            SaveOutcome::Saved { .. } => {}
+            SaveOutcome::Conflict { .. } => panic!("draft save must not conflict"),
+        }
+        let clean = Store::new(home.clone());
+        assert!(
+            clean.get(&id).is_some_and(|n| !n.dirty),
+            "after save the reopened note is clean"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

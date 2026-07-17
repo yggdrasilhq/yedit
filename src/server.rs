@@ -94,6 +94,36 @@ fn handle_conn(stream: TcpStream, state: &Mutex<PaneState>) {
     };
 
     match (method, path) {
+        ("POST", "/open") => {
+            // The thin client's verb (Phase 4 daemon split): route a file
+            // into this daemon and return. The CLIENT resolved the path
+            // against its own cwd — the daemon's cwd is meaningless for it.
+            let raw = body["path"].as_str().unwrap_or_default();
+            let mut pane = state.lock().unwrap();
+            if raw.is_empty() {
+                // No file: just ensure the surface has something to show
+                // (session restore already ran at daemon start).
+                respond_json(
+                    stream,
+                    200,
+                    &json!({ "ok": true, "document_version": version_of(&pane) }),
+                );
+                return;
+            }
+            match pane.store.open(Path::new(raw)) {
+                Ok(id) => {
+                    let version = version_of(&pane);
+                    respond_json(
+                        stream,
+                        200,
+                        &json!({ "ok": true, "id": id, "document_version": version }),
+                    );
+                }
+                Err(error) => {
+                    respond_json(stream, 200, &json!({ "ok": false, "error": error.to_string() }));
+                }
+            }
+        }
         ("GET", "/ping") => {
             // Endpoint-ping liveness (libyggterm Phase 2): answering IS the
             // proof of life — a suspended yedit stops answering, a detached
@@ -326,6 +356,10 @@ fn handle_action(state: &Mutex<PaneState>, body: &Value) -> Value {
     absorb_editor_draft(&mut pane, values);
     let mut toast: Option<String> = None;
     match action {
+        // The GUI's debounced draft-sync (Phase 4): the absorb above already
+        // did all the work — the draft is now in the store AND its sqlite
+        // row, which is the crash-safety story. Nothing else to do.
+        "draft" => {}
         "switch" => {
             if pane.store.notes.iter().any(|n| n.id == value) {
                 pane.store.active_id = Some(value);
@@ -454,6 +488,11 @@ fn handle_action(state: &Mutex<PaneState>, body: &Value) -> Value {
         reply["toast"] = Value::String(toast);
     }
     reply
+}
+
+/// The stamp under an already-held lock (route handlers).
+fn version_of(pane: &PaneState) -> String {
+    format!("{}:{}", pane.store.epoch, pane.conflict.is_some())
 }
 
 /// The declare stamp: schema content changes exactly when the store mutates.
