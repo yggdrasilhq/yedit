@@ -21,6 +21,8 @@ pub struct PaneState {
     /// Set when a save hit the revision guard; the schema then shows the
     /// Overwrite / Reload choice until the user picks one.
     pub conflict: Option<String>,
+    /// The sidebar's tab filter (the search box). Empty = show every note.
+    pub search: String,
 }
 
 pub struct Server {
@@ -34,6 +36,7 @@ pub fn spawn(store: Store) -> Result<Server> {
     let state = Arc::new(Mutex::new(PaneState {
         store,
         conflict: None,
+        search: String::new(),
     }));
     {
         let state = Arc::clone(&state);
@@ -90,6 +93,10 @@ fn handle_conn(stream: TcpStream, state: &Mutex<PaneState>) {
             let pane = state.lock().unwrap();
             respond_json(stream, 200, &document_schema(&pane));
         }
+        ("GET", "/pane/notes") => {
+            let pane = state.lock().unwrap();
+            respond_json(stream, 200, &notes_schema(&pane));
+        }
         ("POST", "/action") => {
             let reply = handle_action(state, &body);
             respond_json(stream, 200, &reply);
@@ -98,77 +105,13 @@ fn handle_conn(stream: TcpStream, state: &Mutex<PaneState>) {
     }
 }
 
-/// The whole document surface, as widgets. Bar (in declaration order): note
-/// tabs, markdown toggle, save, close, dirty marker + path label, and the
-/// open-or-create input. Body: the rendered markdown OR the plain editor —
-/// or, with nothing open, the recent files as rows.
+/// The VIEWPORT pane: the document body ONLY (user direction 2026-07-17 —
+/// "the viewport should be just the text editor"). Rendered markdown in
+/// markdown mode, the line-numbered plain editor otherwise; the recent files
+/// when nothing is open. Every control lives in the sidebar pane.
 fn document_schema(pane: &PaneState) -> Value {
     let store = &pane.store;
     let mut widgets: Vec<Value> = Vec::new();
-    if !store.notes.is_empty() {
-        let tabs: Vec<Value> = store
-            .notes
-            .iter()
-            .map(|note| {
-                let label = if note.dirty {
-                    format!("● {}", note.name())
-                } else {
-                    note.name()
-                };
-                json!({ "id": note.id, "label": label })
-            })
-            .collect();
-        widgets.push(json!({
-            "kind": "tabs", "id": "tabs", "action": "switch",
-            "tabs": tabs,
-            "active": store.active_id.clone().unwrap_or_default(),
-        }));
-        widgets.push(json!({
-            "kind": "toggle", "id": "markdown_mode", "label": "Markdown",
-            "action": "toggle_markdown", "value": store.markdown_mode,
-        }));
-        if let Some(conflict) = &pane.conflict {
-            widgets.push(json!({
-                "kind": "label", "muted": true,
-                "text": format!("⚠ {conflict} changed on disk"),
-            }));
-            widgets.push(json!({
-                "kind": "button", "id": "overwrite", "label": "Overwrite",
-                "action": "overwrite", "primary": true,
-            }));
-            widgets.push(json!({
-                "kind": "button", "id": "reload", "label": "Reload from disk",
-                "action": "reload",
-            }));
-        } else {
-            widgets.push(json!({
-                "kind": "button", "id": "save", "label": "💾\u{fe0e} Save",
-                "action": "save",
-                "primary": store.active().is_some_and(|note| note.dirty),
-            }));
-        }
-        widgets.push(json!({
-            "kind": "button", "id": "close", "label": "✕",
-            "action": "close_active",
-        }));
-        if let Some(note) = store.active() {
-            widgets.push(json!({
-                "kind": "label", "muted": true,
-                "text": note.path.to_string_lossy(),
-            }));
-        }
-    } else {
-        widgets.push(json!({ "kind": "section", "text": "yedit" }));
-    }
-    widgets.push(json!({
-        "kind": "text-input", "id": "open_path",
-        "placeholder": "open or create: ~/notes/todo.md",
-        "value": "", "action": "open",
-    }));
-    widgets.push(json!({
-        "kind": "button", "id": "open_btn", "label": "Open", "action": "open",
-    }));
-
     match store.active() {
         Some(note) if store.markdown_mode => {
             widgets.push(json!({
@@ -178,7 +121,7 @@ fn document_schema(pane: &PaneState) -> Value {
         Some(note) => {
             widgets.push(json!({
                 "kind": "text-input", "id": "editor", "multiline": true,
-                "value": note.content, "rows": 40,
+                "line_numbers": true, "value": note.content,
             }));
         }
         None => {
@@ -198,6 +141,87 @@ fn document_schema(pane: &PaneState) -> Value {
                 }));
             }
         }
+    }
+    json!({ "title": "Yedit", "widgets": widgets })
+}
+
+/// The SIDEBAR pane (yggterm auto-opens it with the document): search box
+/// filtering the vertical note tabs, the markdown toggle, save (or the
+/// conflict choice), the open-or-create box, then the tabs as rows — the
+/// ychrome vertical-tab shape.
+fn notes_schema(pane: &PaneState) -> Value {
+    let store = &pane.store;
+    let mut widgets: Vec<Value> = Vec::new();
+    widgets.push(json!({
+        "kind": "search-box", "id": "search",
+        "placeholder": "Filter notes…",
+        "value": pane.search, "action": "search",
+    }));
+    widgets.push(json!({
+        "kind": "toggle", "id": "markdown_mode", "label": "Markdown preview",
+        "action": "toggle_markdown", "value": store.markdown_mode,
+    }));
+    if let Some(conflict) = &pane.conflict {
+        widgets.push(json!({
+            "kind": "label", "muted": true,
+            "text": format!("⚠ {conflict} changed on disk"),
+        }));
+        widgets.push(json!({
+            "kind": "button", "id": "overwrite", "label": "Overwrite",
+            "action": "overwrite", "primary": true,
+        }));
+        widgets.push(json!({
+            "kind": "button", "id": "reload", "label": "Reload from disk",
+            "action": "reload",
+        }));
+    } else {
+        widgets.push(json!({
+            "kind": "button", "id": "save", "label": "💾\u{fe0e} Save",
+            "action": "save",
+            "primary": store.active().is_some_and(|note| note.dirty),
+        }));
+    }
+    widgets.push(json!({
+        "kind": "text-input", "id": "open_path",
+        "placeholder": "open or create: ~/notes/todo.md",
+        "value": "", "action": "open",
+    }));
+    widgets.push(json!({ "kind": "section", "text": "Notes" }));
+    let filter = pane.search.to_lowercase();
+    let mut shown = 0usize;
+    for note in &store.notes {
+        if !filter.is_empty() && !note.name().to_lowercase().contains(&filter) {
+            continue;
+        }
+        shown += 1;
+        let active = store.active_id.as_deref() == Some(note.id.as_str());
+        let mut title = note.name();
+        if note.dirty {
+            title = format!("● {title}");
+        }
+        if active {
+            title = format!("▸ {title}");
+        }
+        widgets.push(json!({
+            "kind": "list-row",
+            "id": note.id,
+            "title": title,
+            "subtitle": note.path.to_string_lossy(),
+            "actions": [
+                { "action": "switch", "label": "⤢", "title": "Show this note" },
+                { "action": "close_note", "label": "✕", "title": "Close this note" },
+            ],
+        }));
+    }
+    if shown == 0 {
+        widgets.push(json!({
+            "kind": "label", "muted": true,
+            "text": if store.notes.is_empty() {
+                "No notes open. Open one above.".to_string()
+            } else {
+                format!("No note matches \"{}\".", pane.search)
+            },
+        }));
     }
     json!({ "title": "Yedit", "widgets": widgets })
 }
@@ -281,6 +305,15 @@ fn handle_action(state: &Mutex<PaneState>, body: &Value) -> Value {
                 pane.conflict = None;
             }
         }
+        "close_note" => {
+            if pane.store.notes.iter().any(|n| n.id == value) {
+                pane.store.close(&value);
+                pane.conflict = None;
+            }
+        }
+        "search" => {
+            pane.search = values["search"].as_str().unwrap_or_default().trim().to_string();
+        }
         "open" => {
             let raw = values["open_path"].as_str().unwrap_or_default().trim().to_string();
             if raw.is_empty() {
@@ -304,7 +337,18 @@ fn handle_action(state: &Mutex<PaneState>, body: &Value) -> Value {
         }
         _ => toast = Some(format!("Unknown action {action}")),
     }
-    let mut reply = json!({ "schema": document_schema(&pane) });
+    // Answer with the schema of the pane that POSTED, and have the GUI
+    // refetch the viewport when a sidebar action changed the document.
+    let posting_pane = body["pane"].as_str().unwrap_or("doc");
+    let schema = if posting_pane == "notes" {
+        notes_schema(&pane)
+    } else {
+        document_schema(&pane)
+    };
+    let mut reply = json!({ "schema": schema });
+    if posting_pane == "notes" && action != "search" {
+        reply["refetch_document"] = Value::Bool(true);
+    }
     if let Some(toast) = toast {
         reply["toast"] = Value::String(toast);
     }

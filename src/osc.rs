@@ -28,12 +28,23 @@ pub fn emit_declare(session: &str, control: &str, document_version: &str) {
         "document_version": document_version,
         "panes": [
             {
-                // U+FE0E forces text presentation so the glyph sits with
-                // yggterm's monochrome chrome instead of a colour emoji.
+                // The document body — rendered by yggterm in the main
+                // viewport (placement "viewport").
                 "id": "doc",
                 "icon": "🗒\u{fe0e}",
                 "title": "Yedit (tabbed notepad / markdown reader)",
                 "placement": "viewport",
+            },
+            {
+                // The ONE sidebar: vertical note tabs + search + the
+                // markdown/save controls. yggterm auto-opens it with the
+                // document (the ychrome tab-rail shape).
+                // U+FE0E forces text presentation so the glyph sits with
+                // yggterm's monochrome chrome instead of a colour emoji.
+                "id": "notes",
+                "icon": "🗒\u{fe0e}",
+                "title": "Yedit notes (tabs, search, save)",
+                "placement": "rail",
             },
         ],
     });
