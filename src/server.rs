@@ -22,7 +22,11 @@ pub struct PaneState {
     /// Overwrite / Reload choice until the user picks one.
     pub conflict: Option<String>,
     /// The sidebar's tab filter (the search box). Empty = show every note.
+    /// Compiled as a regex when it parses; substring match otherwise.
     pub search: String,
+    /// Whether the open-or-create path input is shown (the 📂 toolbar
+    /// button toggles it — keeps the resting sidebar to the essentials).
+    pub open_input: bool,
 }
 
 pub struct Server {
@@ -37,6 +41,7 @@ pub fn spawn(store: Store) -> Result<Server> {
         store,
         conflict: None,
         search: String::new(),
+        open_input: false,
     }));
     {
         let state = Arc::clone(&state);
@@ -114,8 +119,16 @@ fn document_schema(pane: &PaneState) -> Value {
     let mut widgets: Vec<Value> = Vec::new();
     match store.active() {
         Some(note) if store.markdown_mode => {
+            // Markdown mode EDITS too (user 2026-07-17): editor left,
+            // live preview right — the preview renders the editor's draft
+            // per keystroke GUI-side (live_from), no round trip.
+            widgets.push(json!({
+                "kind": "text-input", "id": "editor", "multiline": true,
+                "line_numbers": true, "value": note.content,
+            }));
             widgets.push(json!({
                 "kind": "markdown", "id": "body", "source": note.content,
+                "live_from": "editor",
             }));
         }
         Some(note) => {
@@ -145,22 +158,43 @@ fn document_schema(pane: &PaneState) -> Value {
     json!({ "title": "Yedit", "widgets": widgets })
 }
 
-/// The SIDEBAR pane (yggterm auto-opens it with the document): search box
-/// filtering the vertical note tabs, the markdown toggle, save (or the
-/// conflict choice), the open-or-create box, then the tabs as rows — the
-/// ychrome vertical-tab shape.
+/// The SIDEBAR pane (yggterm auto-opens it with the document). Top to
+/// bottom, per the user's spec (2026-07-17): quick-actions toolbar (the
+/// MS-Office strip), the regex search over every note's name AND content,
+/// the markdown/text slider, the "Files +" heading, then the notes as
+/// Live-Sessions-style rows (whole row switches, ✕ closes).
 fn notes_schema(pane: &PaneState) -> Value {
     let store = &pane.store;
     let mut widgets: Vec<Value> = Vec::new();
-    widgets.push(json!({
-        "kind": "search-box", "id": "search",
-        "placeholder": "Filter notes…",
-        "value": pane.search, "action": "search",
-    }));
-    widgets.push(json!({
-        "kind": "toggle", "id": "markdown_mode", "label": "Markdown preview",
-        "action": "toggle_markdown", "value": store.markdown_mode,
-    }));
+    let mut toolbar = vec![
+        json!({
+            "action": "save", "label": "💾\u{fe0e}",
+            "title": "Save the active note (Ctrl+S)",
+            "primary": store.active().is_some_and(|note| note.dirty),
+        }),
+        json!({
+            "action": "new_note", "label": "🗋\u{fe0e}",
+            "title": "New note",
+        }),
+        json!({
+            "action": "toggle_open_input", "label": "📂\u{fe0e}",
+            "title": "Open or create a file by path",
+        }),
+    ];
+    if store.active().is_some() {
+        toolbar.push(json!({
+            "action": "close_active", "label": "✕",
+            "title": "Close the active note",
+        }));
+    }
+    widgets.push(json!({ "kind": "toolbar", "id": "quick", "buttons": toolbar }));
+    if pane.open_input {
+        widgets.push(json!({
+            "kind": "text-input", "id": "open_path",
+            "placeholder": "open or create: ~/notes/todo.md",
+            "value": "", "action": "open",
+        }));
+    }
     if let Some(conflict) = &pane.conflict {
         widgets.push(json!({
             "kind": "label", "muted": true,
@@ -174,41 +208,68 @@ fn notes_schema(pane: &PaneState) -> Value {
             "kind": "button", "id": "reload", "label": "Reload from disk",
             "action": "reload",
         }));
-    } else {
-        widgets.push(json!({
-            "kind": "button", "id": "save", "label": "💾\u{fe0e} Save",
-            "action": "save",
-            "primary": store.active().is_some_and(|note| note.dirty),
-        }));
     }
     widgets.push(json!({
-        "kind": "text-input", "id": "open_path",
-        "placeholder": "open or create: ~/notes/todo.md",
-        "value": "", "action": "open",
+        "kind": "search-box", "id": "search",
+        "placeholder": "Search notes (regex)…",
+        "value": pane.search, "action": "search",
     }));
-    widgets.push(json!({ "kind": "section", "text": "Notes" }));
-    let filter = pane.search.to_lowercase();
+    widgets.push(json!({
+        "kind": "toggle", "id": "markdown_mode", "label": "Markdown",
+        "action": "toggle_markdown", "value": store.markdown_mode,
+    }));
+    widgets.push(json!({
+        "kind": "section", "text": "Files",
+        "action": "new_note", "action_label": "+",
+        "action_title": "New note",
+    }));
+
+    // The filter: regex when it compiles, substring otherwise; matched
+    // against the note NAME and its full CONTENT (open notes carry their
+    // buffers). A content hit reports its match count.
+    let query = pane.search.trim();
+    let matcher = regex::RegexBuilder::new(query)
+        .case_insensitive(true)
+        .build()
+        .ok();
     let mut shown = 0usize;
     for note in &store.notes {
-        if !filter.is_empty() && !note.name().to_lowercase().contains(&filter) {
+        let name = note.name();
+        let (name_hit, content_hits) = if query.is_empty() {
+            (true, 0)
+        } else if let Some(re) = &matcher {
+            (re.is_match(&name), re.find_iter(&note.content).count())
+        } else {
+            let needle = query.to_lowercase();
+            (
+                name.to_lowercase().contains(&needle),
+                note.content.to_lowercase().matches(&needle).count(),
+            )
+        };
+        if !name_hit && content_hits == 0 {
             continue;
         }
         shown += 1;
         let active = store.active_id.as_deref() == Some(note.id.as_str());
-        let mut title = note.name();
-        if note.dirty {
-            title = format!("● {title}");
-        }
-        if active {
-            title = format!("▸ {title}");
-        }
+        let subtitle = if content_hits > 0 {
+            format!("{content_hits} match{}", if content_hits == 1 { "" } else { "es" })
+        } else {
+            String::new()
+        };
+        let title = if note.dirty {
+            format!("● {name}")
+        } else {
+            name
+        };
         widgets.push(json!({
             "kind": "list-row",
             "id": note.id,
+            "icon": "🗒\u{fe0e}",
             "title": title,
-            "subtitle": note.path.to_string_lossy(),
+            "subtitle": subtitle,
+            "selected": active,
+            "row_action": "switch",
             "actions": [
-                { "action": "switch", "label": "⤢", "title": "Show this note" },
                 { "action": "close_note", "label": "✕", "title": "Close this note" },
             ],
         }));
@@ -217,7 +278,7 @@ fn notes_schema(pane: &PaneState) -> Value {
         widgets.push(json!({
             "kind": "label", "muted": true,
             "text": if store.notes.is_empty() {
-                "No notes open. Open one above.".to_string()
+                "No files open. 🗋 creates one; 📂 opens a path.".to_string()
             } else {
                 format!("No note matches \"{}\".", pane.search)
             },
@@ -236,9 +297,7 @@ fn absorb_editor_draft(pane: &mut PaneState, values: &Value) {
     let Some(active_id) = pane.store.active_id.clone() else {
         return;
     };
-    if !pane.store.markdown_mode {
-        pane.store.edit(&active_id, draft.to_string());
-    }
+    pane.store.edit(&active_id, draft.to_string());
 }
 
 fn handle_action(state: &Mutex<PaneState>, body: &Value) -> Value {
@@ -314,12 +373,38 @@ fn handle_action(state: &Mutex<PaneState>, body: &Value) -> Value {
         "search" => {
             pane.search = values["search"].as_str().unwrap_or_default().trim().to_string();
         }
+        "new_note" => {
+            let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let mut n = 1usize;
+            let path = loop {
+                let candidate = dir.join(format!("untitled-{n}.md"));
+                let already_open = pane
+                    .store
+                    .notes
+                    .iter()
+                    .any(|note| note.path == candidate);
+                if !candidate.exists() && !already_open {
+                    break candidate;
+                }
+                n += 1;
+            };
+            match pane.store.open(&path) {
+                Ok(_) => toast = Some(format!("New note {} (created on save)", path.display())),
+                Err(error) => toast = Some(format!("New note failed: {error}")),
+            }
+        }
+        "toggle_open_input" => {
+            pane.open_input = !pane.open_input;
+        }
         "open" => {
             let raw = values["open_path"].as_str().unwrap_or_default().trim().to_string();
             if raw.is_empty() {
                 toast = Some("Enter a path to open".to_string());
-            } else if let Err(error) = pane.store.open(Path::new(&raw)) {
-                toast = Some(format!("Open failed: {error}"));
+            } else {
+                match pane.store.open(Path::new(&raw)) {
+                    Ok(_) => pane.open_input = false,
+                    Err(error) => toast = Some(format!("Open failed: {error}")),
+                }
             }
         }
         "open_recent" => {
