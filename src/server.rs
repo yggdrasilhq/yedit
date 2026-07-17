@@ -242,8 +242,13 @@ fn pane_schema(store: &Store, draft_path: Option<&str>) -> Value {
 
 fn handle_pane_action(state: &Mutex<Store>, body: &Value) -> Value {
     let action = body["action"].as_str().unwrap_or_default();
-    let row = body["row"].as_str().unwrap_or_default();
     let values = &body["values"];
+    // A list-row's item id rides `values.value` (yggterm's app-pane action
+    // POST shape); `body.row` kept as a fallback for direct API callers.
+    let row = values["value"]
+        .as_str()
+        .or_else(|| body["row"].as_str())
+        .unwrap_or_default();
     let mut store = state.lock().unwrap();
     let mut toast: Option<String> = None;
     let mut draft: Option<String> = None;
