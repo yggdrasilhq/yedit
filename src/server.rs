@@ -321,10 +321,17 @@ fn notes_schema(pane: &PaneState) -> Value {
         } else {
             name
         };
+        // `file:<ext>` — yggterm draws a rectangle badge carrying the
+        // extension text ("md", "txt"; "·" when the file has none).
+        let ext = note
+            .path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
         widgets.push(json!({
             "kind": "list-row",
             "id": note.id,
-            "icon": "🗒\u{fe0e}",
+            "icon": format!("file:{ext}"),
             "title": title,
             "subtitle": subtitle,
             "selected": active,
