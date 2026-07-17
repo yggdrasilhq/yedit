@@ -94,6 +94,22 @@ fn handle_conn(stream: TcpStream, state: &Mutex<PaneState>) {
     };
 
     match (method, path) {
+        ("GET", "/ping") => {
+            // Endpoint-ping liveness (libyggterm Phase 2): answering IS the
+            // proof of life — a suspended yedit stops answering, a detached
+            // one keeps its surface alive without a PTY client. The stamp
+            // rides along so a GUI that no longer reads declares still
+            // notices content changes and refetches.
+            respond_json(
+                stream,
+                200,
+                &json!({
+                    "ok": true,
+                    "app_name": "Yedit",
+                    "document_version": document_version(state),
+                }),
+            );
+        }
         ("GET", "/pane/doc") => {
             let pane = state.lock().unwrap();
             respond_json(stream, 200, &document_schema(&pane));
