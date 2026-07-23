@@ -465,6 +465,78 @@ impl Store {
         self.touch();
         Ok(())
     }
+
+    /// Rename a note. The name IS the file's basename, so a rename re-targets
+    /// the note's path (and, since the id is the path's hash, re-keys it). A
+    /// bare name keeps the note in its current directory; a name with a path
+    /// separator moves it there. An UNSAVED note (no file on disk yet) just
+    /// changes where it WILL be saved — the in-DB rename the user asked for.
+    /// A saved note's file is moved on disk with it. The dirty buffer and its
+    /// crash-safety draft row follow the note to the new path.
+    pub fn rename(&mut self, id: &str, new_name: &str) -> Result<String> {
+        let new_name = new_name.trim();
+        if new_name.is_empty() {
+            anyhow::bail!("a name is required");
+        }
+        let Some(note) = self.get(id) else {
+            anyhow::bail!("unknown note {id}");
+        };
+        let old_path = note.path.clone();
+        let was_active = self.active_id.as_deref() == Some(id);
+        let was_dirty = note.dirty;
+        // A bare name stays in the note's directory; a pathful name relocates.
+        let raw = Path::new(new_name);
+        let target = if raw.components().count() > 1 || new_name.starts_with('~') {
+            self.resolve(raw)
+        } else {
+            match old_path.parent() {
+                Some(dir) => dir.join(new_name),
+                None => self.resolve(raw),
+            }
+        };
+        if target == old_path {
+            return Ok(id.to_string());
+        }
+        let new_id = note_id(&target);
+        if self.notes.iter().any(|n| n.id == new_id) {
+            anyhow::bail!("a note named {} is already open", new_name);
+        }
+        // Move the file on disk if it exists (a saved note); an unsaved note
+        // has nothing on disk to move. Never clobber an existing target.
+        if old_path.exists() {
+            if target.exists() {
+                anyhow::bail!("{} already exists", target.display());
+            }
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            std::fs::rename(&old_path, &target)
+                .with_context(|| format!("renaming {} to {}", old_path.display(), target.display()))?;
+        }
+        // Re-key the note in place. loaded_revision moves with the file (an
+        // unsaved note stays "new").
+        if let Some(note) = self.get_mut(id) {
+            note.path = target.clone();
+            note.id = new_id.clone();
+            if old_path.exists() {
+                note.loaded_revision = disk_revision(&target);
+            }
+        }
+        if was_active {
+            self.active_id = Some(new_id.clone());
+        }
+        // The draft row is keyed by path: move it so crash safety survives the
+        // rename. A clean note has no row (delete_draft is a harmless no-op).
+        self.delete_draft(&old_path);
+        if was_dirty && let Some(note) = self.get(&new_id) {
+            self.upsert_draft(note);
+        }
+        // The recents list points at paths; retarget the old entry.
+        self.remember_recent(&target);
+        self.touch();
+        Ok(new_id)
+    }
 }
 
 #[cfg(test)]
@@ -575,6 +647,53 @@ mod tests {
             clean.get(&id).is_some_and(|n| !n.dirty),
             "after save the reopened note is clean"
         );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn rename_retargets_an_unsaved_note_and_moves_a_saved_file() {
+        let home = temp_home("rename");
+        let mut store = Store::new(home.clone());
+
+        // An UNSAVED (in-DB) note: rename just re-targets it, no disk file.
+        let untitled = home.join("untitled-1.md");
+        let id = store.open(&untitled).unwrap();
+        store.edit(&id, "draft body".to_string()); // dirty, with a draft row
+        let new_id = store.rename(&id, "todo.md").unwrap();
+        assert_ne!(new_id, id, "the id re-keys with the path");
+        assert_eq!(store.active_id.as_deref(), Some(new_id.as_str()), "active follows");
+        let note = store.get(&new_id).expect("the renamed note is present");
+        assert_eq!(note.name(), "todo.md");
+        assert_eq!(note.content, "draft body", "the dirty buffer follows the rename");
+        assert!(note.dirty);
+        assert!(!untitled.exists(), "an unsaved rename never wrote the old name");
+
+        // The dirty draft row followed to the new path: a crash reopens it there.
+        let reborn = Store::new(home.clone());
+        assert!(
+            reborn.get(&new_id).is_some_and(|n| n.dirty && n.content == "draft body"),
+            "the draft row moved with the note"
+        );
+
+        // A SAVED note: rename moves the file on disk.
+        let mut store = Store::new(home.clone());
+        let saved = home.join("a.md");
+        std::fs::write(&saved, "# saved").unwrap();
+        let id = store.open(&saved).unwrap();
+        let new_id = store.rename(&id, "b.md").unwrap();
+        assert!(!saved.exists(), "the old file is gone");
+        assert_eq!(
+            std::fs::read_to_string(home.join("b.md")).unwrap(),
+            "# saved",
+            "the file moved to the new name with its content"
+        );
+        assert_eq!(store.get(&new_id).unwrap().name(), "b.md");
+
+        // Renaming onto an existing file is refused, not a silent clobber.
+        std::fs::write(home.join("c.md"), "other").unwrap();
+        assert!(store.rename(&new_id, "c.md").is_err(), "rename never clobbers");
+        assert_eq!(std::fs::read_to_string(home.join("c.md")).unwrap(), "other");
+
         let _ = std::fs::remove_dir_all(&home);
     }
 

@@ -27,6 +27,9 @@ pub struct PaneState {
     /// Whether the open-or-create path input is shown (the 📂 toolbar
     /// button toggles it — keeps the resting sidebar to the essentials).
     pub open_input: bool,
+    /// The note id currently being renamed (via the row's right-click menu).
+    /// While set, the sidebar shows a rename field prefilled with its name.
+    pub renaming: Option<String>,
 }
 
 pub struct Server {
@@ -42,6 +45,7 @@ pub fn spawn(store: Store) -> Result<Server> {
         conflict: None,
         search: String::new(),
         open_input: false,
+        renaming: None,
     }));
     {
         let state = Arc::clone(&state);
@@ -242,6 +246,19 @@ fn notes_schema(pane: &PaneState) -> Value {
         }));
     }
     widgets.push(json!({ "kind": "toolbar", "id": "quick", "buttons": toolbar }));
+    // The rename field: shown while a note's row menu asked to rename it,
+    // prefilled with the current name. Enter applies; the ✕ menu / a switch
+    // cancels. Named per-note in the id so switching which note is renamed
+    // rebuilds the field with the new name (the value-epoch remount).
+    if let Some(renaming) = &pane.renaming
+        && let Some(note) = store.get(renaming)
+    {
+        widgets.push(json!({
+            "kind": "text-input", "id": "rename_field",
+            "placeholder": "new name…",
+            "value": note.name(), "action": "rename_apply",
+        }));
+    }
     if pane.open_input {
         widgets.push(json!({
             "kind": "text-input", "id": "open_path",
@@ -341,6 +358,12 @@ fn notes_schema(pane: &PaneState) -> Value {
             "actions": [
                 { "action": "close_note", "label": "✕", "title": "Close this note" },
             ],
+            // Right-click menu: Rename (the only way to name an in-DB note) and
+            // Close. yggterm draws it; the action carries this row's id back.
+            "menu": [
+                { "action": "rename", "label": "✎\u{fe0e}  Rename", "title": "Rename this note" },
+                { "action": "close_note", "label": "✕  Close", "title": "Close this note" },
+            ],
         }));
     }
     if shown == 0 {
@@ -406,8 +429,36 @@ fn handle_action(state: &Mutex<PaneState>, body: &Value) -> Value {
             if pane.store.notes.iter().any(|n| n.id == value) {
                 pane.store.active_id = Some(value);
                 pane.conflict = None;
+                pane.renaming = None;
                 pane.store.touch();
             }
+        }
+        // Row menu → Rename: open the rename field on the picked note (its id
+        // rides `values.value`).
+        "rename" => {
+            if pane.store.notes.iter().any(|n| n.id == value) {
+                pane.renaming = Some(value);
+            }
+        }
+        "rename_apply" => {
+            let new_name = values["rename_field"].as_str().unwrap_or_default().trim();
+            if let Some(id) = pane.renaming.clone() {
+                if new_name.is_empty() {
+                    toast = Some("Enter a name".to_string());
+                } else {
+                    match pane.store.rename(&id, new_name) {
+                        Ok(_) => {
+                            pane.renaming = None;
+                            pane.conflict = None;
+                            toast = Some(format!("Renamed to {new_name}"));
+                        }
+                        Err(error) => toast = Some(format!("Rename failed: {error}")),
+                    }
+                }
+            }
+        }
+        "rename_cancel" => {
+            pane.renaming = None;
         }
         "set_mode" => {
             if let Some(mode) = crate::docs::ViewMode::parse(&value) {
@@ -455,12 +506,16 @@ fn handle_action(state: &Mutex<PaneState>, body: &Value) -> Value {
             if let Some(id) = pane.store.active_id.clone() {
                 pane.store.close(&id);
                 pane.conflict = None;
+                pane.renaming = None;
             }
         }
         "close_note" => {
             if pane.store.notes.iter().any(|n| n.id == value) {
                 pane.store.close(&value);
                 pane.conflict = None;
+                if pane.renaming.as_deref() == Some(value.as_str()) {
+                    pane.renaming = None;
+                }
             }
         }
         "search" => {
@@ -482,7 +537,10 @@ fn handle_action(state: &Mutex<PaneState>, body: &Value) -> Value {
                 n += 1;
             };
             match pane.store.open(&path) {
-                Ok(_) => toast = Some(format!("New note {} (created on save)", path.display())),
+                Ok(_) => {
+                    pane.renaming = None;
+                    toast = Some(format!("New note {} (created on save)", path.display()));
+                }
                 Err(error) => toast = Some(format!("New note failed: {error}")),
             }
         }
