@@ -182,7 +182,14 @@ fn main() -> Result<()> {
         return run_daemon();
     }
 
-    let session = std::env::var("YGGTERM_SESSION_ID").unwrap_or_default();
+    // Detection: `YGGTERM_SESSION_ID` on a directly-spawned yggterm PTY;
+    // `LC_YGGTERM_SESSION_ID` survives a MANUAL `ssh <host>` hop (stock
+    // OpenSSH forwards LC_* — the iTerm2 LC_TERMINAL trick; yggterm exports
+    // both at PTY spawn). The OSC declare rides the PTY byte stream, so it
+    // reaches the GUI from either side of the hop.
+    let session = std::env::var("YGGTERM_SESSION_ID")
+        .or_else(|_| std::env::var("LC_YGGTERM_SESSION_ID"))
+        .unwrap_or_default();
     if args.close {
         if session.is_empty() {
             anyhow::bail!("yedit --close needs a yggterm session (YGGTERM_SESSION_ID unset)");
@@ -218,7 +225,9 @@ fn main() -> Result<()> {
 
     let version = ping(&control_url).context("the yedit daemon stopped answering")?;
     if session.is_empty() {
-        eprintln!("yedit: not inside yggterm (YGGTERM_SESSION_ID unset).");
+        eprintln!("yedit: not inside yggterm (YGGTERM_SESSION_ID / LC_YGGTERM_SESSION_ID unset).");
+        eprintln!("Over ssh, the hop must forward LC_* (stock OpenSSH does) and the");
+        eprintln!("yggterm that spawned the terminal must be 2.12.8+ (LC_ mirror export).");
         eprintln!("Daemon control endpoint at {control_url} — the document surface needs the yggterm GUI.");
         return Ok(());
     }

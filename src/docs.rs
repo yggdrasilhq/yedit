@@ -86,6 +86,9 @@ pub struct Store {
     pub notes: Vec<Note>,
     pub active_id: Option<String>,
     pub view_mode: ViewMode,
+    /// Editor soft-wrap (user spec: ON by default). Declared on the editor
+    /// widget (`word_wrap`) and toggled from the rail status footer.
+    pub word_wrap: bool,
     /// Bumped on every mutation; the page polls it to know when to refetch.
     pub epoch: u64,
     pub recent: Vec<PathBuf>,
@@ -119,6 +122,7 @@ impl Store {
             notes: Vec::new(),
             active_id: None,
             view_mode: ViewMode::Split,
+            word_wrap: true,
             epoch: 1,
             recent: Vec::new(),
             home,
@@ -185,6 +189,8 @@ impl Store {
                 Some(false) => ViewMode::Text,
                 _ => ViewMode::Split,
             });
+        // Absent in pre-wrap sessions -> the ON default stands.
+        self.word_wrap = value["word_wrap"].as_bool().unwrap_or(true);
         if let Some(recent) = value["recent"].as_array() {
             self.recent = recent
                 .iter()
@@ -284,6 +290,7 @@ impl Store {
             .map(|n| n.path.to_string_lossy().into_owned());
         let value = json!({
             "view_mode": self.view_mode.as_str(),
+            "word_wrap": self.word_wrap,
             "open": self.notes.iter().map(|n| n.path.to_string_lossy()).collect::<Vec<_>>(),
             "active": active_path,
             "recent": self.recent.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),

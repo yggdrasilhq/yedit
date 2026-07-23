@@ -176,7 +176,8 @@ fn document_schema(pane: &PaneState) -> Value {
         Some(note) if store.view_mode == ViewMode::Split => {
             widgets.push(json!({
                 "kind": "text-input", "id": "editor", "multiline": true,
-                "line_numbers": true, "value": note.content,
+                "line_numbers": true, "word_wrap": store.word_wrap,
+                "value": note.content,
             }));
             widgets.push(json!({
                 "kind": "markdown", "id": "body", "source": note.content,
@@ -186,7 +187,8 @@ fn document_schema(pane: &PaneState) -> Value {
         Some(note) => {
             widgets.push(json!({
                 "kind": "text-input", "id": "editor", "multiline": true,
-                "line_numbers": true, "value": note.content,
+                "line_numbers": true, "word_wrap": store.word_wrap,
+                "value": note.content,
             }));
         }
         None => {
@@ -351,7 +353,26 @@ fn notes_schema(pane: &PaneState) -> Value {
             },
         }));
     }
-    json!({ "title": "Yedit", "widgets": widgets })
+    // The rail STATUS FOOTER (yggterm pins it under the scroll area): wc of
+    // the active note plus the wrap toggle. The counts reflect the store's
+    // buffer — the live keystroke draft only reaches the daemon on actions
+    // (draft sync/save), so mid-typing counts lag by one sync. Fine for a
+    // status bar; a per-keystroke wc would put app logic GUI-side.
+    let mut footer: Vec<Value> = Vec::new();
+    if let Some(note) = store.active() {
+        let words = note.content.split_whitespace().count();
+        let lines = note.content.split('\n').count();
+        let chars = note.content.chars().count();
+        footer.push(json!({
+            "kind": "label",
+            "text": format!("{words} words \u{b7} {lines} lines \u{b7} {chars} chars"),
+        }));
+    }
+    footer.push(json!({
+        "kind": "toggle", "id": "wrap", "label": "Wrap",
+        "action": "toggle_wrap", "value": store.word_wrap,
+    }));
+    json!({ "title": "Yedit", "widgets": widgets, "footer": footer })
 }
 
 /// Flush the editor draft up into the active note. Runs FIRST on every
@@ -467,6 +488,13 @@ fn handle_action(state: &Mutex<PaneState>, body: &Value) -> Value {
         }
         "toggle_open_input" => {
             pane.open_input = !pane.open_input;
+        }
+        "toggle_wrap" => {
+            // The toggle's next state rides `values.value` ("true"/"false").
+            pane.store.word_wrap = value == "true";
+            // touch(): the editor widget's `word_wrap` lives in the DOCUMENT
+            // schema, so the stamp must move for the viewport to refetch.
+            pane.store.touch();
         }
         "open" => {
             let raw = values["open_path"].as_str().unwrap_or_default().trim().to_string();
