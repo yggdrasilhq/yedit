@@ -246,19 +246,11 @@ fn notes_schema(pane: &PaneState) -> Value {
         }));
     }
     widgets.push(json!({ "kind": "toolbar", "id": "quick", "buttons": toolbar }));
-    // The rename field: shown while a note's row menu asked to rename it,
-    // prefilled with the current name. Enter applies; the ✕ menu / a switch
-    // cancels. Named per-note in the id so switching which note is renamed
-    // rebuilds the field with the new name (the value-epoch remount).
-    if let Some(renaming) = &pane.renaming
-        && let Some(note) = store.get(renaming)
-    {
-        widgets.push(json!({
-            "kind": "text-input", "id": "rename_field",
-            "placeholder": "new name…",
-            "value": note.name(), "action": "rename_apply",
-        }));
-    }
+    // NOTE: renaming is declared ON THE ROW (`rename` below), not as a field
+    // floating above the list. A separate input elsewhere in the rail made the
+    // user hunt for where their typing went; yggterm's row rename replaces the
+    // row body in place — the same shape a Live Sessions rename has — and
+    // carries the ✨ generate button for free.
     if pane.open_input {
         widgets.push(json!({
             "kind": "text-input", "id": "open_path",
@@ -347,7 +339,7 @@ fn notes_schema(pane: &PaneState) -> Value {
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        widgets.push(json!({
+        let mut row = json!({
             "kind": "list-row",
             "id": note.id,
             "icon": format!("file:{ext}"),
@@ -355,6 +347,11 @@ fn notes_schema(pane: &PaneState) -> Value {
             "subtitle": subtitle,
             "selected": active,
             "row_action": "switch",
+            // Rows are draggable to reorder. The order IS `store.notes`, so a
+            // drop is just a permutation of that vec — and it persists with the
+            // session, because a list the user arranged and lost on restart is
+            // worse than one that never moved.
+            "reorder_action": "reorder_notes",
             "actions": [
                 { "action": "close_note", "label": "✕", "title": "Close this note" },
             ],
@@ -364,7 +361,21 @@ fn notes_schema(pane: &PaneState) -> Value {
                 { "action": "rename", "label": "✎\u{fe0e}  Rename", "title": "Rename this note" },
                 { "action": "close_note", "label": "✕  Close", "title": "Close this note" },
             ],
-        }));
+        });
+        // The row being renamed becomes an in-place field. `ai_source` is the
+        // note's own text, which is what makes yggterm show the ✨ button and
+        // name the note from its content — yggterm owns the LLM settings, this
+        // app only says WHAT to name.
+        if pane.renaming.as_deref() == Some(note.id.as_str()) {
+            row["rename"] = json!({
+                "value": note.name(),
+                "action": "rename_apply",
+                "cancel_action": "rename_cancel",
+                "ai_source": note.content,
+                "placeholder": "new name…",
+            });
+        }
+        widgets.push(row);
     }
     if shown == 0 {
         widgets.push(json!({
@@ -441,7 +452,11 @@ fn handle_action(state: &Mutex<PaneState>, body: &Value) -> Value {
             }
         }
         "rename_apply" => {
-            let new_name = values["rename_field"].as_str().unwrap_or_default().trim();
+            // The row's inline field posts under `rename:<row id>` (yggterm's
+            // widget-id rule for a row rename). The old `rename_field` key was
+            // the floating input that no longer exists.
+            let draft_key = format!("rename:{}", pane.renaming.clone().unwrap_or_default());
+            let new_name = values[&draft_key].as_str().unwrap_or_default().trim();
             if let Some(id) = pane.renaming.clone() {
                 if new_name.is_empty() {
                     toast = Some("Enter a name".to_string());
@@ -459,6 +474,23 @@ fn handle_action(state: &Mutex<PaneState>, body: &Value) -> Value {
         }
         "rename_cancel" => {
             pane.renaming = None;
+        }
+        // A row was dragged to a new slot. yggterm sends the pane's whole new
+        // order in `values.order`; adopt it wholesale rather than re-deriving
+        // the move — the GUI already resolved before-vs-after against the rows
+        // the user was actually looking at.
+        "reorder_notes" => {
+            let order: Vec<String> = values["order"]
+                .as_array()
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| id.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if pane.store.reorder_notes(&order) {
+                pane.store.touch();
+            }
         }
         "set_mode" => {
             if let Some(mode) = crate::docs::ViewMode::parse(&value) {

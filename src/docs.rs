@@ -328,6 +328,36 @@ impl Store {
         self.notes.iter().find(|n| n.id == id)
     }
 
+    /// Adopt `order` (note ids, from the rail's drag) as the new note order.
+    /// Returns whether anything moved, so the caller only bumps the epoch on a
+    /// real change.
+    ///
+    /// `self.notes` IS the order — `persist_session` writes it as `open`, so a
+    /// reorder survives a restart with no extra state. Ids the order does not
+    /// mention keep their relative positions at the END rather than being
+    /// dropped: the rail can legitimately be showing a FILTERED list (the
+    /// search box), and a reorder of what the user can see must never delete
+    /// what they cannot.
+    pub fn reorder_notes(&mut self, order: &[String]) -> bool {
+        if order.is_empty() {
+            return false;
+        }
+        let before: Vec<String> = self.notes.iter().map(|note| note.id.clone()).collect();
+        let mut ranked: Vec<(usize, Note)> = Vec::with_capacity(self.notes.len());
+        for note in self.notes.drain(..) {
+            let rank = order
+                .iter()
+                .position(|id| *id == note.id)
+                .unwrap_or(usize::MAX);
+            ranked.push((rank, note));
+        }
+        // Stable by rank: unranked notes (rank MAX) keep their prior order and
+        // trail the ranked ones.
+        ranked.sort_by_key(|(rank, _)| *rank);
+        self.notes = ranked.into_iter().map(|(_, note)| note).collect();
+        self.notes.iter().map(|note| note.id.clone()).collect::<Vec<_>>() != before
+    }
+
     pub fn get_mut(&mut self, id: &str) -> Option<&mut Note> {
         self.notes.iter_mut().find(|n| n.id == id)
     }
@@ -554,6 +584,77 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn store_with_notes(tag: &str, names: &[&str]) -> (PathBuf, Store) {
+        let home = temp_home(tag);
+        let mut store = Store::new(home.clone());
+        for name in names {
+            let file = home.join(name);
+            std::fs::write(&file, format!("body of {name}")).unwrap();
+            store.open(&file).unwrap();
+        }
+        (home, store)
+    }
+
+    fn names(store: &Store) -> Vec<String> {
+        store.notes.iter().map(|note| note.name()).collect()
+    }
+
+    #[test]
+    fn reorder_adopts_the_rails_order_and_reports_whether_anything_moved() {
+        let (home, mut store) = store_with_notes("reorder", &["a.md", "b.md", "c.md"]);
+        let ids: Vec<String> = store.notes.iter().map(|note| note.id.clone()).collect();
+
+        // c, a, b — the order a drag of `c` to the top produces.
+        let moved = vec![ids[2].clone(), ids[0].clone(), ids[1].clone()];
+        assert!(store.reorder_notes(&moved));
+        assert_eq!(names(&store), vec!["c.md", "a.md", "b.md"]);
+
+        // Re-applying the same order changes nothing, so the caller does not
+        // bump the epoch and re-render for a settled drag.
+        assert!(!store.reorder_notes(&moved));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // The rail can be showing a FILTERED list (the search box). A reorder of
+    // what the user can see must never drop what they cannot.
+    #[test]
+    fn reorder_keeps_notes_the_order_does_not_mention() {
+        let (home, mut store) = store_with_notes("reorder-partial", &["a.md", "b.md", "c.md"]);
+        let ids: Vec<String> = store.notes.iter().map(|note| note.id.clone()).collect();
+
+        // Only a and c were visible; c was dragged above a.
+        assert!(store.reorder_notes(&[ids[2].clone(), ids[0].clone()]));
+        assert_eq!(names(&store).len(), 3, "no note may be lost by a reorder");
+        assert_eq!(names(&store)[0], "c.md");
+        assert_eq!(names(&store)[1], "a.md");
+        assert!(names(&store).contains(&"b.md".to_string()));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_empty_order_is_ignored_rather_than_clearing_the_list() {
+        let (home, mut store) = store_with_notes("reorder-empty", &["a.md", "b.md"]);
+        assert!(!store.reorder_notes(&[]));
+        assert_eq!(names(&store), vec!["a.md", "b.md"]);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // The order IS `notes`, and `persist_session` writes that as `open`, so a
+    // rearranged rail comes back rearranged. This is the whole persistence
+    // story — there is no second order to keep in sync.
+    #[test]
+    fn a_reorder_survives_a_restart() {
+        let (home, mut store) = store_with_notes("reorder-restart", &["a.md", "b.md", "c.md"]);
+        let ids: Vec<String> = store.notes.iter().map(|note| note.id.clone()).collect();
+        assert!(store.reorder_notes(&[ids[2].clone(), ids[1].clone(), ids[0].clone()]));
+        store.touch();
+        drop(store);
+
+        let reopened = Store::new(home.clone());
+        assert_eq!(names(&reopened), vec!["c.md", "b.md", "a.md"]);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
