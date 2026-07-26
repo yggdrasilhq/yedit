@@ -177,11 +177,16 @@ fn document_schema(pane: &PaneState) -> Value {
                 "kind": "markdown", "id": "body", "source": note.content,
             }));
         }
+        // `value_key` is the note's id: the editor is ONE slot that holds many
+        // buffers over its life, and yggterm needs to know which one is loaded
+        // to decide whether the field reloads (two new files are both empty, so
+        // the text cannot tell them apart) and to name the draft's owner when
+        // it posts it back.
         Some(note) if store.view_mode == ViewMode::Split => {
             widgets.push(json!({
                 "kind": "text-input", "id": "editor", "multiline": true,
                 "line_numbers": true, "word_wrap": store.word_wrap,
-                "value": note.content,
+                "value": note.content, "value_key": note.id,
             }));
             widgets.push(json!({
                 "kind": "markdown", "id": "body", "source": note.content,
@@ -192,7 +197,7 @@ fn document_schema(pane: &PaneState) -> Value {
             widgets.push(json!({
                 "kind": "text-input", "id": "editor", "multiline": true,
                 "line_numbers": true, "word_wrap": store.word_wrap,
-                "value": note.content,
+                "value": note.content, "value_key": note.id,
             }));
         }
         None => {
@@ -327,10 +332,25 @@ fn notes_schema(pane: &PaneState) -> Value {
         } else {
             String::new()
         };
-        let title = if note.dirty {
-            format!("● {name}")
+        // The save state is a STATUS, not part of the name. It used to be a
+        // literal `●` glued onto the title, which painted in the row's text
+        // colour (a black dot in the light theme) and shoved every name one
+        // character right. yggterm's `list-row` now has the status slot the
+        // native session rows always had; the app only says which class.
+        //
+        // The vocabulary is yggterm's durability vocabulary (DESIGN.md
+        // "Status indicator vocabulary"), and it lines up exactly:
+        //   transient (BLUE)  = the content lives ONLY in yedit's sqlite draft
+        //                       row — dirty, unsaved, nothing on disk yet
+        //   durable   (GREEN) = the content is the file on disk
+        //   ""                = a brand-new note never typed into: no draft
+        //                       row, no file. Empty slot, not a third colour.
+        let status = if note.dirty {
+            "transient"
+        } else if note.path.exists() {
+            "durable"
         } else {
-            name
+            ""
         };
         // `file:<ext>` — yggterm draws a rectangle badge carrying the
         // extension text ("md", "txt"; "·" when the file has none).
@@ -343,7 +363,8 @@ fn notes_schema(pane: &PaneState) -> Value {
             "kind": "list-row",
             "id": note.id,
             "icon": format!("file:{ext}"),
-            "title": title,
+            "title": name,
+            "status": status,
             "subtitle": subtitle,
             "selected": active,
             "row_action": "switch",
@@ -409,27 +430,57 @@ fn notes_schema(pane: &PaneState) -> Value {
     json!({ "title": "Yedit", "widgets": widgets, "footer": footer })
 }
 
-/// Flush the editor draft up into the active note. Runs FIRST on every
+/// Which note an incoming editor draft belongs to.
+///
+/// yggterm names the buffer under `value_keys.editor` — the `value_key` this
+/// app declared on the editor widget when it handed that text out. That is the
+/// ONLY trustworthy target: the debounced draft sync lands seconds after the
+/// keystrokes, and by then `active_id` may already be a different note. Writing
+/// a late draft into whatever happens to be active is how one file's text got
+/// written into another's.
+///
+/// `None` from an older yggterm that declares no identity ⇒ fall back to the
+/// active note, which is exactly the pre-identity behaviour. Refusing instead
+/// would mean the user could not type at all against an old GUI, and losing
+/// every keystroke is worse than the race this replaces.
+fn draft_target_id(pane: &PaneState, value_keys: &Value) -> Option<String> {
+    let target = match value_keys["editor"].as_str() {
+        Some(id) => id.to_string(),
+        None => pane.store.active_id.clone()?,
+    };
+    // A note closed while its draft was in flight takes the draft with it.
+    pane.store
+        .notes
+        .iter()
+        .any(|note| note.id == target)
+        .then_some(target)
+}
+
+/// Flush the editor draft up into the note it BELONGS to. Runs FIRST on every
 /// action, so a mode toggle or tab switch never loses typed content. The
 /// draft only exists while the plain editor is on screen.
-fn absorb_editor_draft(pane: &mut PaneState, values: &Value) {
+fn absorb_editor_draft(pane: &mut PaneState, values: &Value, value_keys: &Value) {
     let Some(draft) = values["editor"].as_str() else {
         return;
     };
-    let Some(active_id) = pane.store.active_id.clone() else {
+    let Some(target) = draft_target_id(pane, value_keys) else {
         return;
     };
-    pane.store.edit(&active_id, draft.to_string());
+    pane.store.edit(&target, draft.to_string());
 }
 
 fn handle_action(state: &Mutex<PaneState>, body: &Value) -> Value {
     let action = body["action"].as_str().unwrap_or_default();
     let values = &body["values"];
+    // Sibling of `values`, not a member of it: `values` is a flat
+    // {widget id: draft} map. `value_keys` says WHICH buffer each of those
+    // drafts came out of.
+    let value_keys = &body["value_keys"];
     // A widget's own value (a tab id, a row id, a toggle's next state) rides
     // `values.value` — yggterm's action POST shape (trap recorded 2026-07-17).
     let value = values["value"].as_str().unwrap_or_default().to_string();
     let mut pane = state.lock().unwrap();
-    absorb_editor_draft(&mut pane, values);
+    absorb_editor_draft(&mut pane, values, value_keys);
     let mut toast: Option<String> = None;
     match action {
         // The GUI's debounced draft-sync (Phase 4): the absorb above already
@@ -654,4 +705,255 @@ fn respond_json(mut stream: TcpStream, status: u16, value: &Value) {
         body.len(),
     );
     let _ = stream.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_home(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "yedit-server-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A pane holding notes. A name in `on_disk` opens SAVED; a name in `new`
+    /// opens as a brand-new never-saved note — the state the collision lives in.
+    fn pane_with(tag: &str, on_disk: &[&str], new: &[&str]) -> (PathBuf, Mutex<PaneState>) {
+        let home = temp_home(tag);
+        let mut store = Store::new(home.clone());
+        for name in on_disk {
+            let file = home.join(name);
+            std::fs::write(&file, format!("body of {name}")).unwrap();
+            store.open(&file).unwrap();
+        }
+        for name in new {
+            store.open(&home.join(name)).unwrap();
+        }
+        (
+            home,
+            Mutex::new(PaneState {
+                store,
+                conflict: None,
+                search: String::new(),
+                open_input: false,
+                renaming: None,
+            }),
+        )
+    }
+
+    fn note_ids(state: &Mutex<PaneState>) -> Vec<String> {
+        state
+            .lock()
+            .unwrap()
+            .store
+            .notes
+            .iter()
+            .map(|note| note.id.clone())
+            .collect()
+    }
+
+    fn content_of(state: &Mutex<PaneState>, id: &str) -> String {
+        state
+            .lock()
+            .unwrap()
+            .store
+            .get(id)
+            .expect("the note is open")
+            .content
+            .clone()
+    }
+
+    // THE corruption (YS-1). The GUI's draft sync is debounced: it POSTs the
+    // editor buffer seconds after the keystrokes. Paste into note A, click note
+    // B before it fires, and the draft lands while B is active. Applying it to
+    // "whatever is active now" wrote A's text into B — silently, over the
+    // user's file. The POST names its buffer; honour that name.
+    #[test]
+    fn a_late_draft_lands_in_the_note_it_was_typed_in_not_the_active_one() {
+        let (home, state) = pane_with("late-draft", &[], &["untitled-1.md", "untitled-2.md"]);
+        let ids = note_ids(&state);
+        let (a, b) = (ids[0].clone(), ids[1].clone());
+
+        // The user is now on note B (they clicked it).
+        state.lock().unwrap().store.active_id = Some(b.clone());
+
+        // A's draft arrives late, naming A.
+        handle_action(
+            &state,
+            &json!({
+                "pane": "doc",
+                "action": "draft",
+                "values": { "editor": "pasted into A" },
+                "value_keys": { "editor": a },
+            }),
+        );
+
+        assert_eq!(content_of(&state, &a), "pasted into A", "A keeps its text");
+        assert_eq!(content_of(&state, &b), "", "B must not inherit A's paste");
+        assert_eq!(
+            state.lock().unwrap().store.active_id.as_deref(),
+            Some(b.as_str()),
+            "absorbing a draft never moves the user"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // A draft for a note that was closed while it was in flight is dropped, not
+    // redirected onto a neighbour.
+    #[test]
+    fn a_draft_for_a_note_that_is_gone_is_dropped() {
+        let (home, state) = pane_with("gone-draft", &[], &["only.md"]);
+        let id = note_ids(&state)[0].clone();
+        handle_action(
+            &state,
+            &json!({
+                "pane": "doc",
+                "action": "draft",
+                "values": { "editor": "text for a closed note" },
+                "value_keys": { "editor": "a-note-id-that-is-not-open" },
+            }),
+        );
+        assert_eq!(content_of(&state, &id), "", "the open note is untouched");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // Back-compat: an older yggterm sends no `value_keys` at all. Falling back
+    // to the active note is exactly the pre-identity behaviour — REFUSING here
+    // would mean the user could not type at all against an old GUI, and losing
+    // every keystroke is worse than the race it replaces.
+    #[test]
+    fn a_draft_with_no_declared_target_still_reaches_the_active_note() {
+        let (home, state) = pane_with("no-keys", &[], &["only.md"]);
+        let id = note_ids(&state)[0].clone();
+        handle_action(
+            &state,
+            &json!({ "pane": "doc", "action": "draft", "values": { "editor": "typed" } }),
+        );
+        assert_eq!(content_of(&state, &id), "typed");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // The editor declares WHICH note it is holding, so yggterm can tell two
+    // empty new files apart and remount the textarea between them.
+    //
+    // EVERY view mode that renders an editor, not just the default: the modes
+    // are separate match arms, and an arm that forgets the identity is exactly
+    // the state the bug lived in.
+    #[test]
+    fn every_editor_widget_declares_the_note_it_is_holding() {
+        use crate::docs::ViewMode;
+        let (home, state) = pane_with("value-key", &["a.md"], &[]);
+        let id = note_ids(&state)[0].clone();
+        let mut seen = 0usize;
+        for mode in [ViewMode::Split, ViewMode::Text, ViewMode::Markdown] {
+            state.lock().unwrap().store.view_mode = mode;
+            let pane = state.lock().unwrap();
+            let schema = document_schema(&pane);
+            for widget in schema["widgets"].as_array().unwrap() {
+                if widget["kind"] != "text-input" {
+                    continue;
+                }
+                seen += 1;
+                assert_eq!(
+                    widget["value_key"],
+                    json!(id),
+                    "the {mode:?} editor must name the note it is holding"
+                );
+            }
+        }
+        assert_eq!(
+            seen, 2,
+            "Split and Text each render an editor; Markdown does not"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // YS-4. The save state is a STATUS, not part of the name: a `●` glued onto
+    // the title painted in the row's text colour and shifted every name one
+    // character right. BLUE (transient) = the content lives only in yedit's
+    // sqlite drafts row; GREEN (durable) = it is the file on disk.
+    #[test]
+    fn a_rows_save_state_is_a_status_class_not_a_glyph_in_its_title() {
+        let (home, state) = pane_with("status", &["saved.md"], &["brand-new.md"]);
+        let ids = note_ids(&state);
+        let (saved, fresh) = (ids[0].clone(), ids[1].clone());
+
+        // Type into the saved note so it goes dirty.
+        state
+            .lock()
+            .unwrap()
+            .store
+            .edit(&saved, "edited".to_string());
+
+        let pane = state.lock().unwrap();
+        let schema = notes_schema(&pane);
+        let row = |id: &str| {
+            schema["widgets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|w| w["id"] == id)
+                .unwrap_or_else(|| panic!("row {id} is in the rail"))
+                .clone()
+        };
+
+        assert_eq!(
+            row(&saved)["status"],
+            json!("transient"),
+            "dirty lives in the db"
+        );
+        assert_eq!(
+            row(&saved)["title"],
+            json!("saved.md"),
+            "the name is just the name"
+        );
+        assert_eq!(
+            row(&fresh)["status"],
+            json!(""),
+            "a new note never typed into is neither in the db nor on disk — empty slot"
+        );
+        for id in [&saved, &fresh] {
+            let title = row(id)["title"].as_str().unwrap().to_string();
+            assert!(
+                !title.contains('\u{25cf}'),
+                "status must not live in the title: {title:?}"
+            );
+        }
+        drop(pane);
+
+        // Saving flips it to the durable class.
+        let content = state
+            .lock()
+            .unwrap()
+            .store
+            .get(&saved)
+            .unwrap()
+            .content
+            .clone();
+        state
+            .lock()
+            .unwrap()
+            .store
+            .save(&saved, content, false)
+            .unwrap();
+        let pane = state.lock().unwrap();
+        let schema = notes_schema(&pane);
+        let row = schema["widgets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["id"] == saved)
+            .unwrap();
+        assert_eq!(row["status"], json!("durable"), "saved is on disk");
+        drop(pane);
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
