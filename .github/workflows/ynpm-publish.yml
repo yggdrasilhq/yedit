@@ -1,0 +1,69 @@
+name: ynpm publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: linux-x64, os: ubuntu-24.04, triple: ""}
+          - {target: linux-arm64, os: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu}
+          - {target: darwin-x64, os: macos-15, triple: ""}
+          - {target: darwin-arm64, os: macos-14, triple: ""}
+          - {target: win32-x64, os: windows-2025, triple: ""}
+          - {target: win32-arm64, os: windows-2025, triple: aarch64-pc-windows-msvc}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+      - name: Build release
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.triple }}" ]; then
+            cargo build --release --target ${{ matrix.triple }}
+          else
+            cargo build --release
+          fi
+      - name: Pack platform package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -e
+          BUILT="target/release"; [ -n "$TRIPLE" ] && BUILT="target/$TRIPLE/release"
+          EXE="yedit"; case "$TARGET" in win32-*) EXE="yedit.exe";; esac
+          mkdir -p "pack/@ygghq/yedit-$TARGET/bin"
+          cp "$BUILT/$EXE" "pack/@ygghq/yedit-$TARGET/bin/yedit"
+          printf '{{"name":"@ygghq/yedit-%s","version":"0.1.0","bin":{{"yedit":"bin/yedit"}},"os":[],"cpu":[],"license":"GPL-3.0-or-later"}}\n' "$TARGET" > "pack/@ygghq/yedit-$TARGET/package.json"
+      - name: Publish platform package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd "pack/@ygghq/yedit-${{ matrix.target }}"
+          npm publish --access public --provenance || echo "version already published"
+
+  publish-main:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
