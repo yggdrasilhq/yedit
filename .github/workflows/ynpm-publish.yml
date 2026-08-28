@@ -44,15 +44,34 @@ jobs:
           set -e
           BUILT="target/release"; [ -n "$TRIPLE" ] && BUILT="target/$TRIPLE/release"
           EXE="yedit"; case "$TARGET" in win32-*) EXE="yedit.exe";; esac
+          case "$TARGET" in
+            linux-x64) PKG_OS=linux; PKG_CPU=x64 ;;
+            linux-arm64) PKG_OS=linux; PKG_CPU=arm64 ;;
+            darwin-x64) PKG_OS=darwin; PKG_CPU=x64 ;;
+            darwin-arm64) PKG_OS=darwin; PKG_CPU=arm64 ;;
+            win32-x64) PKG_OS=win32; PKG_CPU=x64 ;;
+            win32-arm64) PKG_OS=win32; PKG_CPU=arm64 ;;
+          esac
           mkdir -p "pack/@ygghq/yedit-$TARGET/bin"
           cp "$BUILT/$EXE" "pack/@ygghq/yedit-$TARGET/bin/yedit"
-          printf '{{"name":"@ygghq/yedit-%s","version":"0.1.0","bin":{{"yedit":"bin/yedit"}},"os":[],"cpu":[],"license":"GPL-3.0-or-later"}}\n' "$TARGET" > "pack/@ygghq/yedit-$TARGET/package.json"
+          printf '{"name":"@ygghq/yedit-%s","version":"0.1.0","bin":{"yedit":"bin/yedit"},"os":["$PKG_OS"],"cpu":["$PKG_CPU"],"license":"GPL-3.0-or-later","repository":{"type":"git","url":"git+https://github.com/yggdrasilhq/yedit.git"}}\n' "$TARGET" > "pack/@ygghq/yedit-$TARGET/package.json"
       - name: Publish platform package
+        shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          echo '//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}' > ~/.npmrc
           cd "pack/@ygghq/yedit-${{ matrix.target }}"
-          npm publish --access public --provenance || echo "version already published"
+          # IDEMPOTENCE WITHOUT LYING: only the genuine already-published
+          # conflict is a skip; every other publish error fails the step with
+          # its real output (a broken package.json must not report as a clean
+          # skip — that exact mask shipped once and went green publishing
+          # nothing).
+          if ! npm publish --access public --provenance 2>pub_err.txt; then
+            grep -qE "EPUBLISHCONFLICT|previously published|cannot publish over" pub_err.txt || {{ cat pub_err.txt >&2; exit 1; }}
+            echo "version already published — skipping (genuine conflict)"
+          fi
+          rm -f pub_err.txt
 
   publish-main:
     needs: build
