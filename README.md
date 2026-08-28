@@ -16,6 +16,23 @@ rendered-markdown / plain-editor page and contributes a **Notes** pane
   the next run (`~/.yggterm/yedit/session.json`, host-resident).
 - Outside yggterm it serves its page on a loopback URL for a regular browser.
 
+## Install
+
+**ynpm** — ships with yggterm. One manager keeps every yggdrasilhq binary current across
+the whole fleet: generations with rollback, drift-watching, one command.
+
+```sh
+ynpm install @ygghq/yedit
+```
+
+**No npm, no yggterm?** One curl, straight from the registry:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yggdrasilhq/yedit/main/install.sh | sh
+```
+
+Prebuilt for linux (x64, arm64), macOS (x64, arm64), windows (x64, arm64).
+
 ## License
 
 - source code: **GPL-3.0-or-later**, full text in `LICENSE`
