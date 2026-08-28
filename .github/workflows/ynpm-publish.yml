@@ -68,7 +68,7 @@ jobs:
           # skip — that exact mask shipped once and went green publishing
           # nothing).
           if ! npm publish --access public --provenance 2>pub_err.txt; then
-            grep -qE "EPUBLISHCONFLICT|previously published|cannot publish over" pub_err.txt || { cat pub_err.txt >|| {{ cat pub_err.txt >&2; exit 1; }}2; exit 1; }
+            grep -qE "EPUBLISHCONFLICT|previously published|cannot publish over" pub_err.txt || { cat pub_err.txt >&2; exit 1; }
             echo "version already published — skipping (genuine conflict)"
           fi
           rm -f pub_err.txt
