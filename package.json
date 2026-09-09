@@ -20,6 +20,32 @@
   "scripts": {
     "postinstall": "node ./finalize.mjs"
   },
+  "yggterm": {
+    "app": {
+      "name": "yedit",
+      "label": "Yedit",
+      "icon": "",
+      "binary": "yedit",
+      "verbs": [
+        {
+          "id": "new",
+          "label": "New Yedit",
+          "args": [],
+          "row_spawn": true
+        }
+      ],
+      "context_menu": {
+        "enabled": true,
+        "contexts": [
+          "workspace",
+          "session"
+        ],
+        "verbs": [
+          "new"
+        ]
+      }
+    }
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/yggdrasilhq/yedit.git"
