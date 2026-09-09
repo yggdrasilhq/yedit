@@ -7,6 +7,13 @@ libyggterm consumer (ychrome is the pilot).
 rendered-markdown / plain-editor page and contributes a **Notes** pane
 (vertical note tabs, open-or-create path box, recent files) to the right rail.
 
+## Quick start
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yggdrasilhq/yggterm/main/scripts/install.sh | sh
+ynpx @ygghq/yedit
+```
+
 - **Markdown mode** (default): read-optimized rendering, wide tables scroll in
   place, light/dark theme-aware. Toggle to a **plain editor** (Ctrl+E).
 - **Explicit save** (floppy / Ctrl+S) with a **revision guard**: if the file

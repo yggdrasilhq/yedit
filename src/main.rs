@@ -12,13 +12,12 @@
 //! paints them as shell DOM.
 
 mod docs;
-mod manifest;
 mod osc;
 mod server;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -158,7 +157,6 @@ fn ensure_daemon() -> Result<String> {
 /// SIGINT persist the session and exit; drafts are already durable (every
 /// edit writes its row through).
 fn run_daemon() -> Result<()> {
-    manifest::write_best_effort();
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let store = docs::Store::new(home);
     let server = server::spawn(store)?;

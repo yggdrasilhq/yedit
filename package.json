@@ -1,0 +1,58 @@
+{
+  "name": "@ygghq/yedit",
+  "version": "0.1.0",
+  "description": "yedit - the yggdrasilhq build, delivered by ynpm",
+  "bin": {
+    "yedit": "bin/yedit"
+  },
+  "files": [
+    "bin/",
+    "finalize.mjs"
+  ],
+  "optionalDependencies": {
+    "@ygghq/yedit-linux-x64": "0.1.0",
+    "@ygghq/yedit-linux-arm64": "0.1.0",
+    "@ygghq/yedit-darwin-x64": "0.1.0",
+    "@ygghq/yedit-darwin-arm64": "0.1.0",
+    "@ygghq/yedit-win32-x64": "0.1.0",
+    "@ygghq/yedit-win32-arm64": "0.1.0"
+  },
+  "scripts": {
+    "postinstall": "node ./finalize.mjs"
+  },
+  "yggterm": {
+    "app": {
+      "name": "yedit",
+      "label": "Yedit",
+      "icon": "",
+      "binary": "yedit",
+      "verbs": [
+        {
+          "id": "new",
+          "label": "New Yedit",
+          "args": [],
+          "row_spawn": true
+        }
+      ],
+      "context_menu": {
+        "enabled": true,
+        "contexts": [
+          "workspace",
+          "session"
+        ],
+        "verbs": [
+          "new"
+        ]
+      }
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yggdrasilhq/yedit.git"
+  },
+  "license": "GPL-3.0-or-later",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}
