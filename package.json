@@ -1,6 +1,6 @@
 {
   "name": "@ygghq/yedit",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "yedit - the yggdrasilhq build, delivered by ynpm",
   "bin": {
     "yedit": "bin/yedit"
@@ -10,17 +10,23 @@
     "finalize.mjs"
   ],
   "optionalDependencies": {
-    "@ygghq/yedit-linux-x64": "0.1.0",
-    "@ygghq/yedit-linux-arm64": "0.1.0",
-    "@ygghq/yedit-darwin-x64": "0.1.0",
-    "@ygghq/yedit-darwin-arm64": "0.1.0",
-    "@ygghq/yedit-win32-x64": "0.1.0",
-    "@ygghq/yedit-win32-arm64": "0.1.0"
+    "@ygghq/yedit-linux-x64": "0.1.1",
+    "@ygghq/yedit-linux-arm64": "0.1.1",
+    "@ygghq/yedit-darwin-x64": "0.1.1",
+    "@ygghq/yedit-darwin-arm64": "0.1.1",
+    "@ygghq/yedit-win32-x64": "0.1.1",
+    "@ygghq/yedit-win32-arm64": "0.1.1"
   },
   "scripts": {
     "postinstall": "node ./finalize.mjs"
   },
+  "ynpm": {
+    "build": "cargo build --release",
+    "bins": { "yedit": "target/release/yedit" },
+    "watch": "@ygghq/yedit"
+  },
   "yggterm": {
+    "schema": 1,
     "app": {
       "name": "yedit",
       "label": "Yedit",

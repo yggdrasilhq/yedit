@@ -54,7 +54,8 @@ jobs:
           esac
           mkdir -p "pack/@ygghq/yedit-$TARGET/bin"
           cp "$BUILT/$EXE" "pack/@ygghq/yedit-$TARGET/bin/yedit"
-          printf '{"name":"@ygghq/yedit-%s","version":"0.1.0","bin":{"yedit":"bin/yedit"},"os":["$PKG_OS"],"cpu":["$PKG_CPU"],"license":"GPL-3.0-or-later","repository":{"type":"git","url":"git+https://github.com/yggdrasilhq/yedit.git"}}\n' "$TARGET" > "pack/@ygghq/yedit-$TARGET/package.json"
+          VER=$(node -p "require('./package.json').version")
+          printf '{"name":"@ygghq/yedit-%s","version":"%s","bin":{"yedit":"bin/yedit"},"os":["%s"],"cpu":["%s"],"license":"GPL-3.0-or-later","repository":{"type":"git","url":"git+https://github.com/yggdrasilhq/yedit.git"}}\n' "$TARGET" "$VER" "$PKG_OS" "$PKG_CPU" > "pack/@ygghq/yedit-$TARGET/package.json"
       - name: Publish platform package
         shell: bash
         env:
